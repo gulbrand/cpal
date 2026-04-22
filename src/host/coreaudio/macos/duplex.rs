@@ -1,11 +1,13 @@
 use super::{
-    asbd_from_config, frames_to_duration, host_time_to_stream_instant, invoke_error_callback,
-    DuplexCallbackPtr, Stream, StreamInner,
+    asbd_from_config, host_time_to_stream_instant, invoke_error_callback, DuplexCallbackPtr,
+    Stream, StreamInner,
 };
 use crate::duplex::DuplexCallbackInfo;
+use crate::host::frames_to_duration;
+use crate::traits::DeviceTrait;
 use crate::{
-    BackendSpecificError, BufferSize, BuildStreamError, Data, SampleFormat, StreamConfig,
-    StreamError,
+    BufferSize, Data, Error, ErrorKind, FrameCount, InputStreamTimestamp, OutputStreamTimestamp,
+    SampleFormat, StreamConfig, StreamInstant,
 };
 use coreaudio::audio_unit::{AudioUnit, Element, Scope};
 use objc2_audio_toolbox::{
@@ -20,11 +22,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
-use super::device::{
-    estimate_capture_instant, estimate_playback_instant, get_device_buffer_frame_size,
-    set_sample_rate, Device, AUDIO_UNIT_IO_ENABLED,
-};
-use crate::traits::DeviceTrait;
+use super::device::{get_device_buffer_frame_size, set_sample_rate, Device, AUDIO_UNIT_IO_ENABLED};
 
 type DuplexProcFn = dyn FnMut(
     NonNull<AudioUnitRenderActionFlags>,
@@ -80,21 +78,21 @@ impl Device {
     // See: https://developer.apple.com/library/archive/technotes/tn2091/_index.html
     pub(crate) fn build_duplex_stream_raw<D, E>(
         &self,
-        config: &crate::duplex::DuplexStreamConfig,
+        config: crate::duplex::DuplexStreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
-        _timeout: Option<std::time::Duration>,
-    ) -> Result<Stream, BuildStreamError>
+        timeout: Option<std::time::Duration>,
+    ) -> Result<Stream, Error>
     where
         D: FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         if !self.supports_duplex() {
-            return Err(BuildStreamError::StreamConfigNotSupported);
+            return Err(ErrorKind::UnsupportedConfig.into());
         }
 
-        set_sample_rate(self.audio_device_id, config.sample_rate)?;
+        set_sample_rate(self.audio_device_id, config.sample_rate, timeout)?;
 
         let mut audio_unit = AudioUnit::new(coreaudio::audio_unit::IOType::HalOutput)?;
 
@@ -157,13 +155,7 @@ impl Device {
             )?;
         }
 
-        let current_buffer_size = get_device_buffer_frame_size(&audio_unit).map_err(|e| {
-            BuildStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: e.to_string(),
-                },
-            }
-        })?;
+        let current_buffer_size = get_device_buffer_frame_size(&audio_unit).map_err(Error::from)?;
 
         let sample_rate = config.sample_rate;
         let device_buffer_frames = current_buffer_size;
@@ -214,7 +206,7 @@ impl Device {
 
                 let callback_instant = match host_time_to_stream_instant(timestamp.mHostTime) {
                     Err(err) => {
-                        invoke_error_callback(&error_callback_for_callback, err.into());
+                        invoke_error_callback(&error_callback_for_callback, err);
                         return 0;
                     }
                     Ok(cb) => cb,
@@ -231,21 +223,17 @@ impl Device {
                     Data::from_parts(buffer.mData as *mut (), output_samples, sample_format)
                 };
 
-                let delay = frames_to_duration(device_buffer_frames, sample_rate);
+                let delay = frames_to_duration(device_buffer_frames as FrameCount, sample_rate);
+                let capture = callback_instant
+                    .checked_sub(delay)
+                    .unwrap_or(StreamInstant::ZERO);
+                let playback = callback_instant + delay;
 
-                let capture =
-                    estimate_capture_instant(callback_instant, delay, &error_callback_for_callback);
-                let playback = estimate_playback_instant(
-                    callback_instant,
-                    delay,
-                    &error_callback_for_callback,
-                );
-
-                let input_timestamp = crate::InputStreamTimestamp {
+                let input_timestamp = InputStreamTimestamp {
                     callback: callback_instant,
                     capture,
                 };
-                let output_timestamp = crate::OutputStreamTimestamp {
+                let output_timestamp = OutputStreamTimestamp {
                     callback: callback_instant,
                     playback,
                 };
@@ -275,14 +263,10 @@ impl Device {
                 if status != 0 {
                     invoke_error_callback(
                         &error_callback_for_callback,
-                        StreamError::BackendSpecific {
-                            err: BackendSpecificError {
-                                description: format!(
-                                    "AudioUnitRender failed for input: OSStatus {}",
-                                    status
-                                ),
-                            },
-                        },
+                        Error::with_message(
+                            ErrorKind::Other,
+                            format!("AudioUnitRender failed for input: OSStatus {status}"),
+                        ),
                     );
                     input_buffer[..input_bytes].fill(0);
                 }
@@ -330,7 +314,7 @@ impl Device {
         };
 
         let error_callback_clone = error_callback.clone();
-        let error_callback_for_stream: super::ErrorCallback = Box::new(move |err: StreamError| {
+        let error_callback_for_stream: super::ErrorCallback = Box::new(move |err: Error| {
             invoke_error_callback(&error_callback_clone, err);
         });
 
@@ -339,11 +323,7 @@ impl Device {
         stream
             .inner
             .lock()
-            .map_err(|_| BuildStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?
+            .map_err(|_| Error::with_message(ErrorKind::StreamInvalidated, "stream lock poisoned"))?
             .audio_unit
             .start()?;
 

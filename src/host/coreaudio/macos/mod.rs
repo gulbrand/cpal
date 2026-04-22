@@ -1,22 +1,22 @@
 #![allow(deprecated)]
-use super::{asbd_from_config, check_os_status, frames_to_duration, host_time_to_stream_instant};
-
-use super::OSStatus;
-use crate::host::coreaudio::macos::loopback::LoopbackDevice;
-use crate::traits::{HostTrait, StreamTrait};
-use crate::{BackendSpecificError, DevicesError, PauseStreamError, PlayStreamError};
-use coreaudio::audio_unit::AudioUnit;
-use objc2_core_audio::AudioDeviceID;
 use std::mem::ManuallyDrop;
 use std::sync::{mpsc, Arc, Mutex, Weak};
 
-pub use self::enumerate::{default_input_device, default_output_device, Devices};
-
+use coreaudio::audio_unit::AudioUnit;
 use objc2_core_audio::{
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyDeviceIsAlive,
-    kAudioObjectPropertyElementMain, kAudioObjectPropertyScopeGlobal, AudioObjectPropertyAddress,
+    kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyElementMain,
+    kAudioObjectPropertyScopeGlobal, AudioDeviceID, AudioObjectPropertyAddress,
 };
 use property_listener::AudioObjectPropertyListener;
+
+pub use self::enumerate::{default_input_device, default_output_device, Devices};
+use super::{asbd_from_config, check_os_status, host_time_to_stream_instant, OSStatus};
+use crate::{
+    host::coreaudio::macos::loopback::LoopbackDevice,
+    traits::{HostTrait, StreamTrait},
+    Error, ErrorKind, FrameCount, ResultExt, StreamInstant,
+};
 
 mod device;
 mod duplex;
@@ -30,7 +30,7 @@ pub use device::Device;
 pub struct Host;
 
 impl Host {
-    pub fn new() -> Result<Self, crate::HostUnavailable> {
+    pub fn new() -> Result<Self, Error> {
         Ok(Host)
     }
 }
@@ -44,7 +44,7 @@ impl HostTrait for Host {
         true
     }
 
-    fn devices(&self) -> Result<Self::Devices, DevicesError> {
+    fn devices(&self) -> Result<Self::Devices, Error> {
         Devices::new()
     }
 
@@ -58,14 +58,14 @@ impl HostTrait for Host {
 }
 
 /// Type alias for the error callback to reduce complexity
-type ErrorCallback = Box<dyn FnMut(crate::StreamError) + Send + 'static>;
+type ErrorCallback = Box<dyn FnMut(Error) + Send + 'static>;
 
 /// Invoke error callback, recovering from poisoned mutex if needed.
 /// Returns true if callback was invoked, false if skipped due to WouldBlock.
 #[inline]
-fn invoke_error_callback<E>(error_callback: &Mutex<E>, err: crate::StreamError) -> bool
+fn invoke_error_callback<E>(error_callback: &Arc<Mutex<E>>, err: Error) -> bool
 where
-    E: FnMut(crate::StreamError) + Send,
+    E: FnMut(Error) + Send,
 {
     match error_callback.try_lock() {
         Ok(mut cb) => {
@@ -90,7 +90,7 @@ where
 ///
 /// When a device disconnects, this manager:
 /// 1. Attempts to pause the stream to stop audio I/O
-/// 2. Calls the error callback with `StreamError::DeviceNotAvailable`
+/// 2. Calls the error callback with `ErrorKind::DeviceNotAvailable`
 ///
 /// The dedicated thread architecture ensures `Stream` can implement `Send`.
 struct DisconnectManager {
@@ -104,50 +104,55 @@ impl DisconnectManager {
         stream_weak: Weak<Mutex<StreamInner>>,
         error_callback: Arc<Mutex<ErrorCallback>>,
         listen_buffer_size: bool,
-    ) -> Result<Self, crate::BuildStreamError> {
+    ) -> Result<Self, Error> {
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
-        let (disconnect_tx, disconnect_rx) = mpsc::channel();
+        let (disconnect_tx, disconnect_rx) = mpsc::channel::<Error>();
         let (ready_tx, ready_rx) = mpsc::channel();
 
-        let (buffer_size_tx, buffer_size_rx) = mpsc::channel();
-
-        let disconnect_tx_clone = disconnect_tx.clone();
-        let buffer_size_tx_clone = buffer_size_tx.clone();
+        // Spawn a dedicated thread to own all listeners. CoreAudio requires that
+        // AudioObjectPropertyListeners are added and removed on the same thread.
+        let disconnect_tx_alive = disconnect_tx.clone();
+        let disconnect_tx_rate = disconnect_tx.clone();
+        let disconnect_tx_buffer = disconnect_tx;
         std::thread::spawn(move || {
-            let disconnect_address = AudioObjectPropertyAddress {
+            let alive_address = AudioObjectPropertyAddress {
                 mSelector: kAudioDevicePropertyDeviceIsAlive,
                 mScope: kAudioObjectPropertyScopeGlobal,
                 mElement: kAudioObjectPropertyElementMain,
             };
-            let disconnect_fn = move || {
-                let _ = disconnect_tx_clone.send(());
-            };
-            let _disconnect_listener = match AudioObjectPropertyListener::new(
-                device_id,
-                disconnect_address,
-                disconnect_fn,
-            ) {
-                Ok(listener) => listener,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
+            let alive_listener =
+                AudioObjectPropertyListener::new(device_id, alive_address, move || {
+                    let _ = disconnect_tx_alive.send(Error::with_message(
+                        ErrorKind::DeviceNotAvailable,
+                        "device disconnected",
+                    ));
+                });
 
-            let _buffer_size_listener = if listen_buffer_size {
+            let rate_address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyNominalSampleRate,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain,
+            };
+            let rate_listener =
+                AudioObjectPropertyListener::new(device_id, rate_address, move || {
+                    let _ = disconnect_tx_rate.send(Error::with_message(
+                        ErrorKind::StreamInvalidated,
+                        "device sample rate changed",
+                    ));
+                });
+
+            let buffer_size_listener = if listen_buffer_size {
                 let buffer_size_address = AudioObjectPropertyAddress {
                     mSelector: kAudioDevicePropertyBufferFrameSize,
                     mScope: kAudioObjectPropertyScopeGlobal,
                     mElement: kAudioObjectPropertyElementMain,
                 };
-                let buffer_size_fn = move || {
-                    let _ = buffer_size_tx_clone.send(());
-                };
-                match AudioObjectPropertyListener::new(
-                    device_id,
-                    buffer_size_address,
-                    buffer_size_fn,
-                ) {
+                match AudioObjectPropertyListener::new(device_id, buffer_size_address, move || {
+                    let _ = disconnect_tx_buffer.send(Error::with_message(
+                        ErrorKind::StreamInvalidated,
+                        "device buffer size changed",
+                    ));
+                }) {
                     Ok(listener) => Some(listener),
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
@@ -158,63 +163,42 @@ impl DisconnectManager {
                 None
             };
 
-            let _ = ready_tx.send(Ok(()));
-            let _ = shutdown_rx.recv();
-        });
-
-        // Wait for listener creation to complete or fail
-        ready_rx
-            .recv()
-            .map_err(|_| crate::BuildStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "Disconnect listener thread terminated unexpectedly".to_string(),
-                },
-            })??;
-
-        // Handle disconnect events on the main thread pool
-        let stream_weak_clone = stream_weak.clone();
-        let error_callback_clone = error_callback.clone();
-        std::thread::spawn(move || {
-            while disconnect_rx.recv().is_ok() {
-                // Check if stream still exists
-                if let Some(stream_arc) = stream_weak_clone.upgrade() {
-                    // First, try to pause the stream to stop playback
-                    if let Ok(mut stream_inner) = stream_arc.try_lock() {
-                        let _ = stream_inner.pause();
-                    }
-
-                    // Always try to notify about device disconnection
-                    invoke_error_callback(
-                        &error_callback_clone,
-                        crate::StreamError::DeviceNotAvailable,
-                    );
-                } else {
-                    // Stream is gone, exit the handler thread
-                    break;
+            match (alive_listener, rate_listener) {
+                (Ok(_alive), Ok(_rate)) => {
+                    let _buffer_size = buffer_size_listener;
+                    let _ = ready_tx.send(Ok(()));
+                    // Block until the stream is dropped; listeners are removed on drop.
+                    let _ = shutdown_rx.recv();
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = ready_tx.send(Err(e));
                 }
             }
         });
 
-        if listen_buffer_size {
-            let stream_weak_clone = stream_weak.clone();
-            let error_callback_clone = error_callback.clone();
-            std::thread::spawn(move || {
-                while buffer_size_rx.recv().is_ok() {
-                    if let Some(stream_arc) = stream_weak_clone.upgrade() {
-                        if let Ok(mut stream_inner) = stream_arc.try_lock() {
-                            let _ = stream_inner.pause();
-                        }
+        // Wait for listener creation to complete or fail
+        ready_rx.recv().map_err(|_| {
+            Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "disconnect listener thread terminated unexpectedly",
+            )
+        })??;
 
-                        invoke_error_callback(
-                            &error_callback_clone,
-                            crate::StreamError::StreamInvalidated,
-                        );
-                    } else {
-                        break;
+        // Handle events on a separate thread
+        let stream_weak_clone = stream_weak.clone();
+        let error_callback_clone = error_callback.clone();
+        std::thread::spawn(move || {
+            while let Ok(err) = disconnect_rx.recv() {
+                if let Some(stream_arc) = stream_weak_clone.upgrade() {
+                    if let Ok(mut stream_inner) = stream_arc.try_lock() {
+                        let _ = stream_inner.pause();
                     }
+                    invoke_error_callback(&error_callback_clone, err);
+                } else {
+                    break;
                 }
-            });
-        }
+            }
+        });
 
         Ok(DisconnectManager {
             _shutdown_tx: shutdown_tx,
@@ -260,25 +244,21 @@ struct StreamInner {
 }
 
 impl StreamInner {
-    fn play(&mut self) -> Result<(), PlayStreamError> {
+    fn play(&mut self) -> Result<(), Error> {
         if !self.playing {
-            if let Err(e) = self.audio_unit.start() {
-                let description = e.to_string();
-                let err = BackendSpecificError { description };
-                return Err(err.into());
-            }
+            self.audio_unit
+                .start()
+                .context("failed to start audio unit")?;
             self.playing = true;
         }
         Ok(())
     }
 
-    fn pause(&mut self) -> Result<(), PauseStreamError> {
+    fn pause(&mut self) -> Result<(), Error> {
         if self.playing {
-            if let Err(e) = self.audio_unit.stop() {
-                let description = e.to_string();
-                let err = BackendSpecificError { description };
-                return Err(err.into());
-            }
+            self.audio_unit
+                .stop()
+                .context("failed to stop audio unit")?;
             self.playing = false;
         }
         Ok(())
@@ -317,7 +297,7 @@ impl Stream {
         inner: StreamInner,
         error_callback: ErrorCallback,
         listen_buffer_size: bool,
-    ) -> Result<Self, crate::BuildStreamError> {
+    ) -> Result<Self, Error> {
         let device_id = inner.device_id;
         let inner_arc = Arc::new(Mutex::new(inner));
         let weak_inner = Arc::downgrade(&inner_arc);
@@ -334,38 +314,32 @@ impl Stream {
 }
 
 impl StreamTrait for Stream {
-    fn play(&self) -> Result<(), PlayStreamError> {
-        let mut stream = self
-            .inner
+    fn play(&self) -> Result<(), Error> {
+        self.inner
             .lock()
-            .map_err(|_| PlayStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
-
-        stream.play()
+            .map_err(|_| Error::with_message(ErrorKind::StreamInvalidated, "stream lock poisoned"))?
+            .play()
     }
 
-    fn pause(&self) -> Result<(), PauseStreamError> {
-        let mut stream = self
-            .inner
+    fn pause(&self) -> Result<(), Error> {
+        self.inner
             .lock()
-            .map_err(|_| PauseStreamError::BackendSpecific {
-                err: BackendSpecificError {
-                    description: "A cpal stream operation panicked while holding the lock - this is a bug, please report it".to_string(),
-                },
-            })?;
-
-        stream.pause()
+            .map_err(|_| Error::with_message(ErrorKind::StreamInvalidated, "stream lock poisoned"))?
+            .pause()
     }
 
-    fn buffer_size(&self) -> Option<crate::FrameCount> {
-        let stream = self.inner.lock().ok()?;
+    fn now(&self) -> StreamInstant {
+        let m_host_time = unsafe { mach2::mach_time::mach_absolute_time() };
+        host_time_to_stream_instant(m_host_time).expect("mach_timebase_info failed")
+    }
 
+    fn buffer_size(&self) -> Result<FrameCount, Error> {
+        let stream = self.inner.lock().map_err(|_| {
+            Error::with_message(ErrorKind::StreamInvalidated, "stream lock poisoned")
+        })?;
         device::get_device_buffer_frame_size(&stream.audio_unit)
-            .ok()
-            .map(|size| size as crate::FrameCount)
+            .map(|size| size as FrameCount)
+            .context("failed to get buffer frame size")
     }
 }
 
@@ -374,7 +348,7 @@ mod test {
     use crate::{
         default_host,
         traits::{DeviceTrait, HostTrait, StreamTrait},
-        Sample,
+        InputCallbackInfo, OutputCallbackInfo, Sample,
     };
 
     #[test]
@@ -421,7 +395,7 @@ mod test {
         let stream = device
             .build_input_stream(
                 config,
-                move |data: &[f32], _: &crate::InputCallbackInfo| {
+                move |data: &[f32], _: &InputCallbackInfo| {
                     // react to stream events and read or write stream data here.
                     println!("Got data: {:?}", &data[..25]);
                 },
@@ -454,7 +428,7 @@ mod test {
         let stream = device
             .build_input_stream(
                 config,
-                move |data: &[f32], _: &crate::InputCallbackInfo| {
+                move |data: &[f32], _: &InputCallbackInfo| {
                     // react to stream events and read or write stream data here.
                     println!("Got data: {:?}", &data[..25]);
                 },
@@ -466,7 +440,7 @@ mod test {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
-    fn write_silence<T: Sample>(data: &mut [T], _: &crate::OutputCallbackInfo) {
+    fn write_silence<T: Sample>(data: &mut [T], _: &OutputCallbackInfo) {
         for sample in data.iter_mut() {
             *sample = Sample::EQUILIBRIUM;
         }

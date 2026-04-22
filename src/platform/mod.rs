@@ -6,7 +6,6 @@
 
 #[doc(inline)]
 pub use self::platform_impl::*;
-
 #[cfg(feature = "custom")]
 pub use crate::host::custom::{Device as CustomDevice, Host as CustomHost, Stream as CustomStream};
 
@@ -36,7 +35,7 @@ pub use crate::host::custom::{Device as CustomDevice, Host as CustomHost, Stream
 /// SupportedOutputConfigs and all their necessary trait implementations.
 ///
 macro_rules! impl_platform_host {
-    ($($(#[cfg($feat: meta)])? $HostVariant:ident => $Host:ty),* $(,)?) => {
+    ($($(#[cfg($feat: meta)])? $HostVariant:ident $($HostName:literal)? => $Host:ty),* $(,)?) => {
         /// All hosts supported by CPAL on this platform.
         pub const ALL_HOSTS: &'static [HostId] = &[
             $(
@@ -93,14 +92,13 @@ macro_rules! impl_platform_host {
         /// - `"aaudio"` - Android Audio
         /// - `"alsa"` - Advanced Linux Sound Architecture
         /// - `"asio"` - ASIO
+        /// - `"audioworklet"` - Audio Worklet
         /// - `"coreaudio"` - CoreAudio
         /// - `"custom"` - Custom host (requires `custom` feature)
-        /// - `"emscripten"` - Emscripten
         /// - `"jack"` - JACK Audio Connection Kit
         /// - `"null"` - Null host
         /// - `"wasapi"` - Windows Audio Session API
         /// - `"webaudio"` - Web Audio API
-        /// - `"audioworklet"` - Audio Worklet
         ///
         /// # Cross-Platform Example
         ///
@@ -186,11 +184,12 @@ macro_rules! impl_platform_host {
         }
 
         impl HostId {
+            /// Returns the human-readable host name.
             pub fn name(&self) -> &'static str {
                 match self {
                     $(
                         $(#[cfg($feat)])?
-                        HostId::$HostVariant => stringify!($HostVariant),
+                        HostId::$HostVariant => __cpal_select_host_name!($HostVariant, $($HostName)?),
                     )*
                 }
             }
@@ -198,21 +197,37 @@ macro_rules! impl_platform_host {
 
         impl std::fmt::Display for HostId {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}", self.name().to_lowercase())
+                write!(f, "{}", self.name().to_ascii_lowercase())
             }
         }
 
         impl std::str::FromStr for HostId {
-            type Err = crate::HostUnavailable;
+            type Err = crate::Error;
 
+            /// Parse a host identifier from its string representation (e.g. `"alsa"`,
+            /// `"coreaudio"`).
+            ///
+            /// The comparison is case-insensitive. Only hosts compiled in for the current platform
+            /// are recognized; a host string that is valid on another platform is still an error
+            /// here.
+            ///
+            /// # Errors
+            ///
+            /// - [`ErrorKind::UnsupportedOperation`] if the string does not name a host available
+            ///   on this platform.
+            ///
+            /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
             fn from_str(s: &str) -> Result<Self, Self::Err> {
                 $(
                     $(#[cfg($feat)])?
-                    if stringify!($HostVariant).eq_ignore_ascii_case(s) {
+                    if HostId::$HostVariant.name().eq_ignore_ascii_case(s) {
                         return Ok(HostId::$HostVariant);
                     }
                 )*
-                Err(crate::HostUnavailable)
+                Err(crate::Error::with_message(
+                    crate::ErrorKind::UnsupportedOperation,
+                    format!("host \"{s}\" is not supported on this platform"),
+                ))
             }
         }
 
@@ -376,7 +391,7 @@ macro_rules! impl_platform_host {
             type Stream = Stream;
 
             #[allow(deprecated)]
-            fn name(&self) -> Result<String, crate::DeviceNameError> {
+            fn name(&self) -> Result<String, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -385,7 +400,7 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn description(&self) -> Result<crate::DeviceDescription, crate::DeviceNameError> {
+            fn description(&self) -> Result<crate::DeviceDescription, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -394,7 +409,7 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn id(&self) -> Result<crate::DeviceId, crate::DeviceIdError> {
+            fn id(&self) -> Result<crate::DeviceId, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -421,7 +436,7 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, crate::SupportedStreamConfigsError> {
+            fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -434,7 +449,7 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, crate::SupportedStreamConfigsError> {
+            fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -447,7 +462,7 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn default_input_config(&self) -> Result<crate::SupportedStreamConfig, crate::DefaultStreamConfigError> {
+            fn default_input_config(&self) -> Result<crate::SupportedStreamConfig, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -456,7 +471,7 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn default_output_config(&self) -> Result<crate::SupportedStreamConfig, crate::DefaultStreamConfigError> {
+            fn default_output_config(&self) -> Result<crate::SupportedStreamConfig, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -472,10 +487,10 @@ macro_rules! impl_platform_host {
                 data_callback: D,
                 error_callback: E,
                 timeout: Option<std::time::Duration>,
-            ) -> Result<Self::Stream, crate::BuildStreamError>
+            ) -> Result<Self::Stream, crate::Error>
             where
                 D: FnMut(&crate::Data, &crate::InputCallbackInfo) + Send + 'static,
-                E: FnMut(crate::StreamError) + Send + 'static,
+                E: FnMut(crate::Error) + Send + 'static,
             {
                 match self.0 {
                     $(
@@ -501,10 +516,10 @@ macro_rules! impl_platform_host {
                 data_callback: D,
                 error_callback: E,
                 timeout: Option<std::time::Duration>,
-            ) -> Result<Self::Stream, crate::BuildStreamError>
+            ) -> Result<Self::Stream, crate::Error>
             where
                 D: FnMut(&mut crate::Data, &crate::OutputCallbackInfo) + Send + 'static,
-                E: FnMut(crate::StreamError) + Send + 'static,
+                E: FnMut(crate::Error) + Send + 'static,
             {
                 match self.0 {
                     $(
@@ -525,15 +540,15 @@ macro_rules! impl_platform_host {
 
             fn build_duplex_stream_raw<D, E>(
                 &self,
-                config: &crate::duplex::DuplexStreamConfig,
+                config: crate::duplex::DuplexStreamConfig,
                 sample_format: crate::SampleFormat,
                 data_callback: D,
                 error_callback: E,
                 timeout: Option<std::time::Duration>,
-            ) -> Result<Self::Stream, crate::BuildStreamError>
+            ) -> Result<Self::Stream, crate::Error>
             where
                 D: FnMut(&crate::Data, &mut crate::Data, &crate::duplex::DuplexCallbackInfo) + Send + 'static,
-                E: FnMut(crate::StreamError) + Send + 'static,
+                E: FnMut(crate::Error) + Send + 'static,
             {
                 match self.0 {
                     $(
@@ -559,7 +574,7 @@ macro_rules! impl_platform_host {
                 false
             }
 
-            fn devices(&self) -> Result<Self::Devices, crate::DevicesError> {
+            fn devices(&self) -> Result<Self::Devices, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -605,7 +620,7 @@ macro_rules! impl_platform_host {
         }
 
         impl crate::traits::StreamTrait for Stream {
-            fn play(&self) -> Result<(), crate::PlayStreamError> {
+            fn play(&self) -> Result<(), crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -616,7 +631,7 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn pause(&self) -> Result<(), crate::PauseStreamError> {
+            fn pause(&self) -> Result<(), crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
@@ -627,12 +642,23 @@ macro_rules! impl_platform_host {
                 }
             }
 
-            fn buffer_size(&self) -> Option<crate::FrameCount> {
+            fn buffer_size(&self) -> Result<crate::FrameCount, crate::Error> {
                 match self.0 {
                     $(
                         $(#[cfg($feat)])?
                         StreamInner::$HostVariant(ref s) => {
                             s.buffer_size()
+                        }
+                    )*
+                }
+            }
+
+            fn now(&self) -> crate::StreamInstant {
+                match self.0 {
+                    $(
+                        $(#[cfg($feat)])?
+                        StreamInner::$HostVariant(ref s) => {
+                            s.now()
                         }
                     )*
                 }
@@ -706,7 +732,16 @@ macro_rules! impl_platform_host {
         }
 
         /// Given a unique host identifier, initialise and produce the host if it is available.
-        pub fn host_from_id(id: HostId) -> Result<Host, crate::HostUnavailable> {
+        ///
+        /// # Errors
+        ///
+        /// - [`ErrorKind::HostUnavailable`] if the host identified by `id` is not currently
+        ///   reachable (e.g. the audio daemon is not running).
+        /// - [`ErrorKind::Other`] for unclassifiable initialization failures.
+        ///
+        /// [`ErrorKind::HostUnavailable`]: crate::ErrorKind::HostUnavailable
+        /// [`ErrorKind::Other`]: crate::ErrorKind::Other
+        pub fn host_from_id(id: HostId) -> Result<Host, crate::Error> {
             match id {
                 $(
                     $(#[cfg($feat)])?
@@ -724,6 +759,15 @@ macro_rules! impl_platform_host {
                 default_host()
             }
         }
+    };
+}
+
+macro_rules! __cpal_select_host_name {
+    ($variant:ident, $name:literal) => {
+        $name
+    };
+    ($variant:ident,) => {
+        stringify!($variant)
     };
 }
 
@@ -789,8 +833,8 @@ mod platform_impl {
     impl_platform_host!(
         #[cfg(feature = "pipewire")] PipeWire => PipeWireHost,
         #[cfg(feature = "pulseaudio")] PulseAudio => PulseAudioHost,
-        #[cfg(feature = "jack")] Jack => JackHost,
-        Alsa => AlsaHost,
+        #[cfg(feature = "jack")] Jack "JACK" => JackHost,
+        Alsa "ALSA" => AlsaHost,
         #[cfg(feature = "custom")] Custom => super::CustomHost,
     );
 
@@ -814,9 +858,9 @@ mod platform_impl {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_vendor = "apple")]
 mod platform_impl {
-    #[cfg_attr(docsrs, doc(cfg(any(target_os = "macos", target_os = "ios"))))]
+    #[cfg_attr(docsrs, doc(cfg(target_vendor = "apple")))]
     pub use crate::host::coreaudio::Host as CoreAudioHost;
     #[cfg(all(feature = "jack", target_os = "macos"))]
     #[cfg_attr(docsrs, doc(cfg(all(feature = "jack", target_os = "macos"))))]
@@ -824,7 +868,7 @@ mod platform_impl {
 
     impl_platform_host!(
         CoreAudio => CoreAudioHost,
-        #[cfg(all(feature = "jack", target_os = "macos"))] Jack => JackHost,
+        #[cfg(all(feature = "jack", target_os = "macos"))] Jack "JACK" => JackHost,
         #[cfg(feature = "custom")] Custom => super::CustomHost
     );
 
@@ -836,31 +880,8 @@ mod platform_impl {
     }
 }
 
-#[cfg(target_os = "emscripten")]
-mod platform_impl {
-    #[cfg_attr(docsrs, doc(cfg(target_os = "emscripten")))]
-    pub use crate::host::emscripten::Host as EmscriptenHost;
-    impl_platform_host!(
-        Emscripten => EmscriptenHost,
-        #[cfg(feature = "custom")] Custom => super::CustomHost
-    );
-
-    /// The default host for the current compilation target platform.
-    pub fn default_host() -> Host {
-        EmscriptenHost::new()
-            .expect("the default host should always be available")
-            .into()
-    }
-}
-
 #[cfg(all(target_arch = "wasm32", feature = "wasm-bindgen"))]
 mod platform_impl {
-    #[cfg_attr(
-        docsrs,
-        doc(cfg(all(target_arch = "wasm32", feature = "wasm-bindgen")))
-    )]
-    pub use crate::host::webaudio::Host as WebAudioHost;
-
     #[cfg(feature = "audioworklet")]
     #[cfg_attr(
         docsrs,
@@ -871,6 +892,11 @@ mod platform_impl {
         )))
     )]
     pub use crate::host::audioworklet::Host as AudioWorkletHost;
+    #[cfg_attr(
+        docsrs,
+        doc(cfg(all(target_arch = "wasm32", feature = "wasm-bindgen")))
+    )]
+    pub use crate::host::webaudio::Host as WebAudioHost;
 
     impl_platform_host!(
         WebAudio => WebAudioHost,
@@ -898,9 +924,9 @@ mod platform_impl {
     pub use crate::host::wasapi::Host as WasapiHost;
 
     impl_platform_host!(
-        #[cfg(feature = "asio")] Asio => AsioHost,
-        Wasapi => WasapiHost,
-        #[cfg(feature = "jack")] Jack => JackHost,
+        #[cfg(feature = "asio")] Asio "ASIO" => AsioHost,
+        Wasapi "WASAPI" => WasapiHost,
+        #[cfg(feature = "jack")] Jack "JACK" => JackHost,
         #[cfg(feature = "custom")] Custom => super::CustomHost,
     );
 
@@ -935,9 +961,7 @@ mod platform_impl {
     target_os = "dragonfly",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "emscripten",
+    target_vendor = "apple",
     target_os = "android",
     all(target_arch = "wasm32", feature = "wasm-bindgen"),
 )))]
@@ -950,9 +974,7 @@ mod platform_impl {
             target_os = "dragonfly",
             target_os = "freebsd",
             target_os = "netbsd",
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "emscripten",
+            target_vendor = "apple",
             target_os = "android",
             all(target_arch = "wasm32", feature = "wasm-bindgen")
         ))))

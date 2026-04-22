@@ -61,7 +61,7 @@ mod imp {
         println!("Building duplex stream with config: {config:?}");
 
         let stream = device.build_duplex_stream::<f32, _, _>(
-            &config,
+            config,
             move |input, output, _info| {
                 output.fill(Sample::EQUILIBRIUM);
                 let copy_len = input.len().min(output.len());
