@@ -1,7 +1,11 @@
 //! Manages loopback recording (recording system audio output)
 
-use super::device::Device;
-use crate::{host::coreaudio::check_os_status, BackendSpecificError, BuildStreamError};
+use std::{
+    ffi::{c_void, CStr},
+    mem::MaybeUninit,
+    ptr::NonNull,
+};
+
 use objc2::{rc::Retained, AnyThread};
 use objc2_core_audio::{
     kAudioAggregateDeviceNameKey, kAudioAggregateDeviceTapAutoStartKey,
@@ -19,15 +23,13 @@ use objc2_core_foundation::{
     CFString, CFStringCreateWithCString,
 };
 use objc2_foundation::{ns_string, NSArray, NSNumber, NSString};
-use std::{
-    ffi::{c_void, CStr},
-    mem::MaybeUninit,
-    ptr::NonNull,
-};
+
+use super::device::Device;
+use crate::{host::coreaudio::check_os_status, Error, ErrorKind};
 type CFStringRef = *mut std::os::raw::c_void;
 
 impl Device {
-    fn uid(&self) -> Result<Retained<NSString>, BackendSpecificError> {
+    fn uid(&self) -> Result<Retained<NSString>, Error> {
         let mut cfstring: CFStringRef = std::ptr::null_mut();
         let mut size = std::mem::size_of::<CFStringRef>() as u32;
 
@@ -50,9 +52,10 @@ impl Device {
         check_os_status(status)?;
 
         if cfstring.is_null() {
-            return Err(BackendSpecificError {
-                description: "Device uid is null".to_string(),
-            });
+            return Err(Error::with_message(
+                ErrorKind::DeviceNotAvailable,
+                "device UID is null",
+            ));
         }
 
         let ns_string: Retained<NSString> = unsafe {
@@ -80,7 +83,7 @@ pub struct LoopbackDevice {
 impl LoopbackDevice {
     /// Create a [`LoopbackDevice`] that records the sound
     /// output of `device`.
-    pub fn from_device(device: &Device) -> Result<Self, BuildStreamError> {
+    pub fn from_device(device: &Device) -> Result<Self, Error> {
         // 1 - Create tap
 
         // Empty list of processes as we want to record all processes
@@ -103,18 +106,20 @@ impl LoopbackDevice {
 
         let mut tap_obj_id: MaybeUninit<AudioObjectID> = MaybeUninit::uninit();
         let tap_obj_id = unsafe {
-            AudioHardwareCreateProcessTap(Some(tap_desc.as_ref()), tap_obj_id.as_mut_ptr());
+            let status =
+                AudioHardwareCreateProcessTap(Some(tap_desc.as_ref()), tap_obj_id.as_mut_ptr());
+            check_os_status(status)?;
             tap_obj_id.assume_init()
         };
         let tap_uid = unsafe { tap_desc.UUID().UUIDString() };
 
         // 2 - Create aggregate device
         let aggregate_device_properties = create_audio_aggregate_device_properties(tap_uid);
-        let aggregate_device_id: AudioObjectID = 0;
+        let mut aggregate_device_id: AudioObjectID = 0;
         let status = unsafe {
             AudioHardwareCreateAggregateDevice(
                 aggregate_device_properties.as_ref(),
-                NonNull::from(&aggregate_device_id),
+                NonNull::from(&mut aggregate_device_id),
             )
         };
         check_os_status(status)?;

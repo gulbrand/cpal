@@ -5,18 +5,21 @@
 
 extern crate asio_sys as sys;
 
-use crate::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crate::{
-    BuildStreamError, Data, DefaultStreamConfigError, DeviceDescription, DeviceId, DeviceIdError,
-    DeviceNameError, DevicesError, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
-    PlayStreamError, SampleFormat, StreamConfig, StreamError, SupportedStreamConfig,
-    SupportedStreamConfigsError,
+use std::{
+    sync::{Arc, OnceLock},
+    time::Duration,
 };
 
-pub use self::device::{Device, Devices, SupportedInputConfigs, SupportedOutputConfigs};
-pub use self::stream::Stream;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+pub use self::{
+    device::{Device, Devices, SupportedInputConfigs, SupportedOutputConfigs},
+    stream::Stream,
+};
+use crate::{
+    host::com,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Data, DeviceDescription, DeviceId, Error, FrameCount, InputCallbackInfo, OutputCallbackInfo,
+    SampleFormat, StreamConfig, StreamInstant, SupportedStreamConfig,
+};
 
 mod device;
 mod stream;
@@ -34,7 +37,8 @@ pub struct Host {
 }
 
 impl Host {
-    pub fn new() -> Result<Self, crate::HostUnavailable> {
+    pub fn new() -> Result<Self, Error> {
+        com::com_initialized();
         let asio = GLOBAL_ASIO
             .get_or_init(|| Arc::new(sys::Asio::new()))
             .clone();
@@ -52,7 +56,7 @@ impl HostTrait for Host {
         //unimplemented!("check how to do this using asio-sys")
     }
 
-    fn devices(&self) -> Result<Self::Devices, DevicesError> {
+    fn devices(&self) -> Result<Self::Devices, Error> {
         Devices::new(self.asio.clone())
     }
 
@@ -72,45 +76,41 @@ impl DeviceTrait for Device {
     type SupportedOutputConfigs = SupportedOutputConfigs;
     type Stream = Stream;
 
-    fn description(&self) -> Result<DeviceDescription, DeviceNameError> {
+    fn description(&self) -> Result<DeviceDescription, Error> {
         Device::description(self)
     }
 
-    fn id(&self) -> Result<DeviceId, DeviceIdError> {
+    fn id(&self) -> Result<DeviceId, Error> {
         Device::id(self)
     }
 
-    fn supported_input_configs(
-        &self,
-    ) -> Result<Self::SupportedInputConfigs, SupportedStreamConfigsError> {
+    fn supported_input_configs(&self) -> Result<Self::SupportedInputConfigs, Error> {
         Device::supported_input_configs(self)
     }
 
-    fn supported_output_configs(
-        &self,
-    ) -> Result<Self::SupportedOutputConfigs, SupportedStreamConfigsError> {
+    fn supported_output_configs(&self) -> Result<Self::SupportedOutputConfigs, Error> {
         Device::supported_output_configs(self)
     }
 
-    fn default_input_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_input_config(&self) -> Result<SupportedStreamConfig, Error> {
         Device::default_input_config(self)
     }
 
-    fn default_output_config(&self) -> Result<SupportedStreamConfig, DefaultStreamConfigError> {
+    fn default_output_config(&self) -> Result<SupportedStreamConfig, Error> {
         Device::default_output_config(self)
     }
 
     fn build_input_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         Device::build_input_stream_raw(
             self,
@@ -124,15 +124,15 @@ impl DeviceTrait for Device {
 
     fn build_output_stream_raw<D, E>(
         &self,
-        config: &StreamConfig,
+        config: StreamConfig,
         sample_format: SampleFormat,
         data_callback: D,
         error_callback: E,
         timeout: Option<Duration>,
-    ) -> Result<Self::Stream, BuildStreamError>
+    ) -> Result<Self::Stream, Error>
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         Device::build_output_stream_raw(
             self,
@@ -146,11 +146,19 @@ impl DeviceTrait for Device {
 }
 
 impl StreamTrait for Stream {
-    fn play(&self) -> Result<(), PlayStreamError> {
+    fn play(&self) -> Result<(), Error> {
         Stream::play(self)
     }
 
-    fn pause(&self) -> Result<(), PauseStreamError> {
+    fn pause(&self) -> Result<(), Error> {
         Stream::pause(self)
+    }
+
+    fn now(&self) -> StreamInstant {
+        Stream::now(self)
+    }
+
+    fn buffer_size(&self) -> Result<FrameCount, Error> {
+        Stream::buffer_size(self)
     }
 }

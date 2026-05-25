@@ -7,7 +7,10 @@
 //! precisely synchronised.
 
 use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+    Error, ErrorKind, HostId, InputCallbackInfo, OutputCallbackInfo, StreamConfig,
+};
 use ringbuf::{
     traits::{Consumer, Producer, Split},
     HeapRb,
@@ -28,57 +31,56 @@ struct Opt {
     #[arg(short, long, value_name = "DELAY_MS", default_value_t = 150.0)]
     latency: f32,
 
-    /// Use the JACK host
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        ),
-        feature = "jack"
-    ))]
-    #[arg(short, long)]
-    #[allow(dead_code)]
+    /// Use the JACK host. Requires `--features jack`.
+    #[arg(long, default_value_t = false)]
     jack: bool,
+
+    /// Use the PulseAudio host. Requires `--features pulseaudio`.
+    #[arg(long, default_value_t = false)]
+    pulseaudio: bool,
 }
 
 fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
 
-    // Conditionally compile with jack if the feature is specified.
-    #[cfg(all(
-        any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        ),
-        feature = "jack"
+    // JACK/PulseAudio support must be enabled at compile time, and is
+    // only available on some platforms.
+    #[allow(unused_mut, unused_assignments)]
+    let mut jack_host_id: Result<HostId, Error> = Err(ErrorKind::HostUnavailable.into());
+    #[allow(unused_mut, unused_assignments)]
+    let mut pulseaudio_host_id: Result<HostId, Error> = Err(ErrorKind::HostUnavailable.into());
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "netbsd"
     ))]
+    {
+        #[cfg(feature = "jack")]
+        {
+            jack_host_id = Ok(HostId::Jack);
+        }
+
+        #[cfg(feature = "pulseaudio")]
+        {
+            pulseaudio_host_id = Ok(HostId::PulseAudio);
+        }
+    }
+
     // Manually check for flags. Can be passed through cargo with -- e.g.
     // cargo run --release --example beep --features jack -- --jack
     let host = if opt.jack {
-        cpal::host_from_id(cpal::available_hosts()
-            .into_iter()
-            .find(|id| *id == cpal::HostId::Jack)
-            .expect(
-                "make sure --features jack is specified. only works on OSes where jack is available",
-            )).expect("jack host unavailable")
+        jack_host_id
+            .and_then(cpal::host_from_id)
+            .expect("make sure `--features jack` is specified, and the platform is supported")
+    } else if opt.pulseaudio {
+        pulseaudio_host_id
+            .and_then(cpal::host_from_id)
+            .expect("make sure `--features pulseaudio` is specified, and the platform is supported")
     } else {
         cpal::default_host()
     };
-
-    #[cfg(any(
-        not(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "netbsd"
-        )),
-        not(feature = "jack")
-    ))]
-    let host = cpal::default_host();
 
     // Find devices.
     let input_device = if let Some(device) = opt.input_device {
@@ -101,7 +103,7 @@ fn main() -> anyhow::Result<()> {
     println!("Using output device: \"{}\"", output_device.id()?);
 
     // We'll try and use the same configuration between streams to keep it simple.
-    let config: cpal::StreamConfig = input_device.default_input_config()?.into();
+    let config: StreamConfig = input_device.default_input_config()?.into();
 
     // Create a delay in case the input and output devices aren't synced.
     let latency_frames = (opt.latency / 1_000.0) * config.sample_rate as f32;
@@ -118,7 +120,7 @@ fn main() -> anyhow::Result<()> {
         producer.try_push(0.0).unwrap();
     }
 
-    let input_data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
+    let input_data_fn = move |data: &[f32], _: &InputCallbackInfo| {
         let mut output_fell_behind = false;
         for &sample in data {
             if producer.try_push(sample).is_err() {
@@ -130,7 +132,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let output_data_fn = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+    let output_data_fn = move |data: &mut [f32], _: &OutputCallbackInfo| {
         let mut input_fell_behind = false;
         for sample in data {
             *sample = match consumer.try_pop() {
@@ -148,8 +150,8 @@ fn main() -> anyhow::Result<()> {
 
     // Build streams.
     println!("Attempting to build both streams with f32 samples and `{config:?}`.");
-    let input_stream = input_device.build_input_stream(&config, input_data_fn, err_fn, None)?;
-    let output_stream = output_device.build_output_stream(&config, output_data_fn, err_fn, None)?;
+    let input_stream = input_device.build_input_stream(config, input_data_fn, err_fn, None)?;
+    let output_stream = output_device.build_output_stream(config, output_data_fn, err_fn, None)?;
     println!("Successfully built streams.");
 
     // Play the streams.
@@ -160,15 +162,15 @@ fn main() -> anyhow::Result<()> {
     input_stream.play()?;
     output_stream.play()?;
 
-    // Run for 3 seconds before closing.
-    println!("Playing for 3 seconds... ");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // Run for 10 seconds before closing.
+    println!("Playing for 10 seconds... ");
+    std::thread::sleep(std::time::Duration::from_secs(10));
     drop(input_stream);
     drop(output_stream);
     println!("Done!");
     Ok(())
 }
 
-fn err_fn(err: cpal::StreamError) {
+fn err_fn(err: Error) {
     eprintln!("an error occurred on stream: {err}");
 }

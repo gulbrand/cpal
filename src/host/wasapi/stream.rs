@@ -1,18 +1,23 @@
-use super::windows_err_to_cpal_err;
-use crate::traits::StreamTrait;
-use crate::{
-    BackendSpecificError, BufferSize, Data, InputCallbackInfo, OutputCallbackInfo,
-    PauseStreamError, PlayStreamError, SampleFormat, StreamError,
+use std::{
+    mem, ptr,
+    sync::mpsc::{channel, Receiver, SendError, Sender},
+    thread::{self, JoinHandle},
+    time::Duration,
 };
-use std::mem;
-use std::ptr;
-use std::sync::mpsc::{channel, Receiver, SendError, Sender};
-use std::thread::{self, JoinHandle};
-use windows::Win32::Foundation;
-use windows::Win32::Foundation::WAIT_OBJECT_0;
-use windows::Win32::Media::Audio;
-use windows::Win32::System::SystemServices;
-use windows::Win32::System::Threading;
+
+use windows::Win32::{
+    Foundation::{self, WAIT_OBJECT_0},
+    Media::Audio,
+    System::{Performance, SystemServices, Threading},
+};
+
+use crate::{
+    host::{equilibrium::fill_equilibrium, frames_to_duration},
+    traits::StreamTrait,
+    BufferSize, Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
+    OutputCallbackInfo, OutputStreamTimestamp, ResultExt, SampleFormat, SampleRate, StreamConfig,
+    StreamInstant,
+};
 
 pub struct Stream {
     /// The high-priority audio processing thread calling callbacks.
@@ -29,6 +34,12 @@ pub struct Stream {
     // This event is signalled after a new entry is added to `commands`, so that the `run()`
     // method can be notified.
     pending_scheduled_event: Foundation::HANDLE,
+
+    // Callback size in frames.
+    period_frames: FrameCount,
+
+    // QueryPerformanceFrequency result, cached at construction (constant for the system lifetime).
+    qpc_frequency: u64,
 }
 
 // SAFETY: Windows Event HANDLEs are safe to send between threads - they are designed for
@@ -90,13 +101,17 @@ pub struct StreamInner {
     // True if the stream is currently playing. False if paused.
     pub playing: bool,
     // Number of frames of audio data in the underlying buffer allocated by WASAPI.
-    pub max_frames_in_buffer: u32,
+    pub max_frames_in_buffer: FrameCount,
+    // Callback size in frames.
+    pub period_frames: FrameCount,
     // Number of bytes that each frame occupies.
     pub bytes_per_frame: u16,
     // The configuration with which the stream was created.
-    pub config: crate::StreamConfig,
+    pub config: StreamConfig,
     // The sample format with which the stream was created.
     pub sample_format: SampleFormat,
+    // Hardware pipeline latency.
+    pub stream_latency: Duration,
 }
 
 impl Stream {
@@ -107,13 +122,21 @@ impl Stream {
     ) -> Stream
     where
         D: FnMut(&Data, &InputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         let pending_scheduled_event = unsafe {
             Threading::CreateEventA(None, false, false, windows::core::PCSTR(ptr::null()))
         }
         .expect("cpal: could not create input stream event");
         let (tx, rx) = channel();
+
+        let period_frames = stream_inner.period_frames;
+        let mut qpc_frequency: i64 = 0;
+        unsafe {
+            Performance::QueryPerformanceFrequency(&mut qpc_frequency)
+                .expect("QueryPerformanceFrequency failed");
+            debug_assert_ne!(qpc_frequency, 0, "QueryPerformanceFrequency returned zero");
+        }
 
         let run_context = RunContext {
             handles: vec![pending_scheduled_event, stream_inner.event],
@@ -130,6 +153,8 @@ impl Stream {
             thread: Some(thread),
             commands: tx,
             pending_scheduled_event,
+            period_frames,
+            qpc_frequency: qpc_frequency as u64,
         }
     }
 
@@ -140,13 +165,21 @@ impl Stream {
     ) -> Stream
     where
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
-        E: FnMut(StreamError) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
     {
         let pending_scheduled_event = unsafe {
             Threading::CreateEventA(None, false, false, windows::core::PCSTR(ptr::null()))
         }
         .expect("cpal: could not create output stream event");
         let (tx, rx) = channel();
+
+        let period_frames = stream_inner.period_frames;
+        let mut qpc_frequency: i64 = 0;
+        unsafe {
+            Performance::QueryPerformanceFrequency(&mut qpc_frequency)
+                .expect("QueryPerformanceFrequency failed");
+            debug_assert_ne!(qpc_frequency, 0, "QueryPerformanceFrequency returned zero");
+        }
 
         let run_context = RunContext {
             handles: vec![pending_scheduled_event, stream_inner.event],
@@ -163,6 +196,8 @@ impl Stream {
             thread: Some(thread),
             commands: tx,
             pending_scheduled_event,
+            period_frames,
+            qpc_frequency: qpc_frequency as u64,
         }
     }
 
@@ -178,7 +213,9 @@ impl Stream {
 impl Drop for Stream {
     fn drop(&mut self) {
         if self.push_command(Command::Terminate).is_ok() {
-            self.thread.take().unwrap().join().unwrap();
+            if let Some(handle) = self.thread.take() {
+                let _ = handle.join();
+            }
             unsafe {
                 let _ = Foundation::CloseHandle(self.pending_scheduled_event);
             }
@@ -187,16 +224,45 @@ impl Drop for Stream {
 }
 
 impl StreamTrait for Stream {
-    fn play(&self) -> Result<(), PlayStreamError> {
-        self.push_command(Command::PlayStream)
-            .map_err(|_| crate::error::PlayStreamError::DeviceNotAvailable)?;
+    fn play(&self) -> Result<(), Error> {
+        self.push_command(Command::PlayStream).map_err(|_| {
+            Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "stream command channel closed",
+            )
+        })?;
         Ok(())
     }
 
-    fn pause(&self) -> Result<(), PauseStreamError> {
-        self.push_command(Command::PauseStream)
-            .map_err(|_| crate::error::PauseStreamError::DeviceNotAvailable)?;
+    fn pause(&self) -> Result<(), Error> {
+        self.push_command(Command::PauseStream).map_err(|_| {
+            Error::with_message(
+                ErrorKind::StreamInvalidated,
+                "stream command channel closed",
+            )
+        })?;
         Ok(())
+    }
+
+    fn now(&self) -> StreamInstant {
+        let mut counter: i64 = 0;
+        unsafe {
+            Performance::QueryPerformanceCounter(&mut counter)
+                .expect("QueryPerformanceCounter failed");
+        }
+        // Convert to 100-nanosecond units first, matching the precision of WASAPI QPCPosition
+        // values delivered to callbacks. This keeps `now()` on the same 100 ns grid as
+        // callback/capture/playback instants, avoiding false sub-100 ns deltas.
+        let units_100ns = counter as u128 * 10_000_000 / self.qpc_frequency as u128;
+        let nanos = units_100ns * 100;
+        StreamInstant::new(
+            (nanos / 1_000_000_000) as u64,
+            (nanos % 1_000_000_000) as u32,
+        )
+    }
+
+    fn buffer_size(&self) -> Result<FrameCount, Error> {
+        Ok(self.period_frames)
     }
 }
 
@@ -210,7 +276,7 @@ impl Drop for StreamInner {
 
 // Process any pending commands that are queued within the `RunContext`.
 // Returns `true` if the loop should continue running, `false` if it should terminate.
-fn process_commands(run_context: &mut RunContext) -> Result<bool, StreamError> {
+fn process_commands(run_context: &mut RunContext) -> Result<bool, Error> {
     // Process the pending commands.
     for command in run_context.commands.try_iter() {
         match command {
@@ -220,7 +286,7 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, StreamError> {
                         .stream
                         .audio_client
                         .Start()
-                        .map_err(windows_err_to_cpal_err::<StreamError>)?;
+                        .context("failed to start audio client")?;
                     run_context.stream.playing = true;
                 }
             },
@@ -230,7 +296,7 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, StreamError> {
                         .stream
                         .audio_client
                         .Stop()
-                        .map_err(windows_err_to_cpal_err::<StreamError>)?;
+                        .context("failed to stop audio client")?;
                     run_context.stream.playing = false;
                 }
             },
@@ -250,7 +316,7 @@ fn process_commands(run_context: &mut RunContext) -> Result<bool, StreamError> {
 // This is called when the `run` thread is ready to wait for the next event. The
 // next event might be some command submitted by the user (the first handle) or
 // might indicate that one of the streams is ready to deliver or receive audio.
-fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, BackendSpecificError> {
+fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Error> {
     debug_assert!(handles.len() <= SystemServices::MAXIMUM_WAIT_OBJECTS as usize);
     let result = unsafe {
         Threading::WaitForMultipleObjectsEx(
@@ -262,9 +328,10 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Backe
     };
     if result == Foundation::WAIT_FAILED {
         let err = unsafe { Foundation::GetLastError() };
-        let description = format!("`WaitForMultipleObjectsEx failed: {:?}", err);
-        let err = BackendSpecificError { description };
-        return Err(err);
+        return Err(Error::with_message(
+            ErrorKind::StreamInvalidated,
+            format!("WaitForMultipleObjectsEx failed: {err:?}"),
+        ));
     }
     // Notifying the corresponding task handler.
     let handle_idx = (result.0 - WAIT_OBJECT_0.0) as usize;
@@ -272,12 +339,13 @@ fn wait_for_handle_signal(handles: &[Foundation::HANDLE]) -> Result<usize, Backe
 }
 
 // Get the number of available frames that are available for writing/reading.
-fn get_available_frames(stream: &StreamInner) -> Result<u32, StreamError> {
+#[inline]
+fn get_available_frames(stream: &StreamInner) -> Result<FrameCount, Error> {
     unsafe {
         let padding = stream
             .audio_client
             .GetCurrentPadding()
-            .map_err(windows_err_to_cpal_err::<StreamError>)?;
+            .context("failed to get current padding")?;
         Ok(stream.max_frames_in_buffer - padding)
     }
 }
@@ -285,7 +353,7 @@ fn get_available_frames(stream: &StreamInner) -> Result<u32, StreamError> {
 fn run_input(
     mut run_ctxt: RunContext,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
-    error_callback: &mut dyn FnMut(StreamError),
+    error_callback: &mut dyn FnMut(Error),
 ) {
     boost_current_thread_priority(
         run_ctxt.stream.config.buffer_size,
@@ -317,7 +385,7 @@ fn run_input(
 fn run_output(
     mut run_ctxt: RunContext,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
-    error_callback: &mut dyn FnMut(StreamError),
+    error_callback: &mut dyn FnMut(Error),
 ) {
     boost_current_thread_priority(
         run_ctxt.stream.config.buffer_size,
@@ -347,7 +415,7 @@ fn run_output(
 }
 
 #[cfg(feature = "audio_thread_priority")]
-fn boost_current_thread_priority(buffer_size: BufferSize, sample_rate: crate::SampleRate) {
+fn boost_current_thread_priority(buffer_size: BufferSize, sample_rate: SampleRate) {
     use audio_thread_priority::promote_current_thread_to_real_time;
 
     let buffer_size = if let BufferSize::Fixed(buffer_size) = buffer_size {
@@ -363,7 +431,7 @@ fn boost_current_thread_priority(buffer_size: BufferSize, sample_rate: crate::Sa
 }
 
 #[cfg(not(feature = "audio_thread_priority"))]
-fn boost_current_thread_priority(_: BufferSize, _: crate::SampleRate) {
+fn boost_current_thread_priority(_: BufferSize, _: SampleRate) {
     unsafe {
         let thread_handle = Threading::GetCurrentThread();
 
@@ -379,7 +447,7 @@ enum ControlFlow {
 
 fn process_commands_and_await_signal(
     run_context: &mut RunContext,
-    error_callback: &mut dyn FnMut(StreamError),
+    error_callback: &mut dyn FnMut(Error),
 ) -> Option<ControlFlow> {
     // Process queued commands.
     match process_commands(run_context) {
@@ -395,7 +463,7 @@ fn process_commands_and_await_signal(
     let handle_idx = match wait_for_handle_signal(&run_context.handles) {
         Ok(idx) => idx,
         Err(err) => {
-            error_callback(err.into());
+            error_callback(err);
             return Some(ControlFlow::Break);
         }
     };
@@ -414,7 +482,7 @@ fn process_input(
     stream: &StreamInner,
     capture_client: Audio::IAudioCaptureClient,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
-    error_callback: &mut dyn FnMut(StreamError),
+    error_callback: &mut dyn FnMut(Error),
 ) -> ControlFlow {
     unsafe {
         // Get the available data in the shared buffer.
@@ -425,7 +493,7 @@ fn process_input(
                 Ok(0) => return ControlFlow::Continue,
                 Ok(f) => f,
                 Err(err) => {
-                    error_callback(windows_err_to_cpal_err(err));
+                    error_callback(Error::from(err));
                     return ControlFlow::Break;
                 }
             };
@@ -442,7 +510,7 @@ fn process_input(
                 // TODO: Can this happen?
                 Err(e) if e.code() == Audio::AUDCLNT_S_BUFFER_EMPTY => continue,
                 Err(e) => {
-                    error_callback(windows_err_to_cpal_err(e));
+                    error_callback(Error::from(e));
                     return ControlFlow::Break;
                 }
                 Ok(_) => (),
@@ -469,7 +537,7 @@ fn process_input(
             // Release the buffer.
             let result = capture_client
                 .ReleaseBuffer(frames_available)
-                .map_err(windows_err_to_cpal_err);
+                .context("failed to release capture buffer");
             if let Err(err) = result {
                 error_callback(err);
                 return ControlFlow::Break;
@@ -483,7 +551,7 @@ fn process_output(
     stream: &StreamInner,
     render_client: Audio::IAudioRenderClient,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
-    error_callback: &mut dyn FnMut(StreamError),
+    error_callback: &mut dyn FnMut(Error),
 ) -> ControlFlow {
     // The number of frames available for writing.
     let frames_available = match get_available_frames(stream) {
@@ -499,16 +567,19 @@ fn process_output(
         let buffer = match render_client.GetBuffer(frames_available) {
             Ok(b) => b,
             Err(e) => {
-                error_callback(windows_err_to_cpal_err(e));
+                error_callback(Error::from(e));
                 return ControlFlow::Break;
             }
         };
 
         debug_assert!(!buffer.is_null());
 
+        let byte_count = frames_available as usize * stream.bytes_per_frame as usize;
+        let buffer_slice = std::slice::from_raw_parts_mut(buffer, byte_count);
+        fill_equilibrium(buffer_slice, stream.sample_format);
+
         let data = buffer as *mut ();
-        let len = frames_available as usize * stream.bytes_per_frame as usize
-            / stream.sample_format.sample_size();
+        let len = byte_count / stream.sample_format.sample_size();
         let mut data = Data::from_parts(data, len, stream.sample_format);
         let sample_rate = stream.config.sample_rate;
         let timestamp = match output_timestamp(stream, frames_available, sample_rate) {
@@ -522,7 +593,7 @@ fn process_output(
         data_callback(&mut data, &info);
 
         if let Err(err) = render_client.ReleaseBuffer(frames_available, 0) {
-            error_callback(windows_err_to_cpal_err(err));
+            error_callback(err.into());
             return ControlFlow::Break;
         }
     }
@@ -530,30 +601,25 @@ fn process_output(
     ControlFlow::Continue
 }
 
-/// Convert the given duration in frames at the given sample rate to a `std::time::Duration`.
-fn frames_to_duration(frames: u32, rate: crate::SampleRate) -> std::time::Duration {
-    let secsf = frames as f64 / rate as f64;
-    let secs = secsf as u64;
-    let nanos = ((secsf - secs as f64) * 1_000_000_000.0) as u32;
-    std::time::Duration::new(secs, nanos)
-}
-
 /// Use the stream's `IAudioClock` to produce the current stream instant.
 ///
 /// Uses the QPC position produced via the `GetPosition` method.
-fn stream_instant(stream: &StreamInner) -> Result<crate::StreamInstant, StreamError> {
+#[inline]
+fn stream_instant(stream: &StreamInner) -> Result<StreamInstant, Error> {
     let mut position: u64 = 0;
     let mut qpc_position: u64 = 0;
     unsafe {
         stream
             .audio_clock
             .GetPosition(&mut position, Some(&mut qpc_position))
-            .map_err(windows_err_to_cpal_err::<StreamError>)?;
+            .context("failed to get clock position")?;
     };
-    // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
-    let qpc_nanos = qpc_position as i128 * 100;
-    let instant = crate::StreamInstant::from_nanos_i128(qpc_nanos)
-        .expect("performance counter out of range of `StreamInstant` representation");
+    // The `qpc_position` is in 100-nanosecond units.
+    let nanos = qpc_position as u128 * 100;
+    let instant = StreamInstant::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    );
     Ok(instant)
 }
 
@@ -562,16 +628,19 @@ fn stream_instant(stream: &StreamInner) -> Result<crate::StreamInstant, StreamEr
 /// `buffer_qpc_position` is the `qpc_position` returned via the `GetBuffer` call on the capture
 /// client. It represents the instant at which the first sample of the retrieved buffer was
 /// captured.
+#[inline]
 fn input_timestamp(
     stream: &StreamInner,
     buffer_qpc_position: u64,
-) -> Result<crate::InputStreamTimestamp, StreamError> {
-    // The `qpc_position` is in 100 nanosecond units. Convert it to nanoseconds.
-    let qpc_nanos = buffer_qpc_position as i128 * 100;
-    let capture = crate::StreamInstant::from_nanos_i128(qpc_nanos)
-        .expect("performance counter out of range of `StreamInstant` representation");
+) -> Result<InputStreamTimestamp, Error> {
+    // The `qpc_position` is in 100-nanosecond units.
+    let nanos = buffer_qpc_position as u128 * 100;
+    let capture = StreamInstant::new(
+        (nanos / 1_000_000_000) as u64,
+        (nanos % 1_000_000_000) as u32,
+    );
     let callback = stream_instant(stream)?;
-    Ok(crate::InputStreamTimestamp { capture, callback })
+    Ok(InputStreamTimestamp { capture, callback })
 }
 
 /// Produce the output stream timestamp.
@@ -580,19 +649,16 @@ fn input_timestamp(
 /// result of `GetCurrentPadding` from the maximum buffer size.
 ///
 /// `sample_rate` is the rate at which audio frames are processed by the device.
-///
-/// TODO: The returned `playback` is an estimate that assumes audio is delivered immediately after
-/// `frames_available` are consumed. The reality is that there is likely a tiny amount of latency
-/// after this, but not sure how to determine this.
+#[inline]
 fn output_timestamp(
     stream: &StreamInner,
-    frames_available: u32,
-    sample_rate: crate::SampleRate,
-) -> Result<crate::OutputStreamTimestamp, StreamError> {
+    frames_available: FrameCount,
+    sample_rate: SampleRate,
+) -> Result<OutputStreamTimestamp, Error> {
     let callback = stream_instant(stream)?;
-    let buffer_duration = frames_to_duration(frames_available, sample_rate);
-    let playback = callback
-        .add(buffer_duration)
-        .expect("`playback` occurs beyond representation supported by `StreamInstant`");
-    Ok(crate::OutputStreamTimestamp { callback, playback })
+    // `padding` is the number of frames already queued in the endpoint buffer ahead of the
+    // frames we are about to write. Those frames must drain before ours are heard.
+    let padding = stream.max_frames_in_buffer - frames_available;
+    let playback = callback + (frames_to_duration(padding, sample_rate) + stream.stream_latency);
+    Ok(OutputStreamTimestamp { callback, playback })
 }

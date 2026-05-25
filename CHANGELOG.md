@@ -8,14 +8,174 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+
+- `ErrorKind::DeviceBusy` for retryable device access errors (e.g. EBUSY, EAGAIN).
+- `ErrorKind::PermissionDenied` for OS-level access denials.
+- `StreamConfig` now implements `Copy`.
+- `StreamTrait::buffer_size()` to query the stream's current buffer size in frames per callback.
+- `HostTrait::device_by_id()` is now dispatched to each backend's implementation, allowing
+  backends to override it.
+- `StreamTrait::now()` to query the current instant on the stream's clock.
+- **ALSA**: `device_by_id()` now accepts PCM shorthand names such as `hw:0,0` and `plughw:foo`.
+- **CoreAudio**: tvOS target support (Tier 3, requires nightly).
+- **PipeWire**: New host for Linux and some BSDs using the PipeWire API.
+- **PulseAudio**: New host for Linux and some BSDs using the PulseAudio API.
+- `DeviceTrait::build_duplex_stream` and `build_duplex_stream_raw` for synchronized input/output.
+- `duplex` module with `DuplexStreamConfig` and `DuplexCallbackInfo` types.
+- **CoreAudio**: Duplex stream support with hardware-synchronized input/output.
+- Example `duplex_feedback` demonstrating duplex stream usage.
+
+### Changed
+
+- Changed per-operation error types (`DevicesError`, `SupportedStreamConfigsError`, etc.) and
+  `HostUnavailable` into a unfied `Error`/`ErrorKind`. See [UPGRADING.md](UPGRADING.md).
+- `DeviceTrait::build_*_stream()` now takes `StreamConfig` by value instead of `&StreamConfig`
+- `HostId::name()` now returns a more human-friendly name instead of the raw backend identifier.
+- `StreamInstant` API changed and extended to mirror `std::time::Instant`/`Duration`. See
+  [UPGRADING.md](UPGRADING.md) for migration details.
+- **AAudio**: Device names now include the device type suffix (e.g. "Speaker (Builtin Speaker)")
+  for easier identification when enumerating devices.
+- **AAudio**: `supported_input_configs()` and `supported_output_configs()` now return an error for
+  direction-mismatched devices (e.g. querying input configs on an output-only device) instead of
+  silently returning an empty list.
+- **AAudio**: Bump MSRV to 1.85.
+- **AAudio**: Buffers with default sizes are now dynamically tuned.
+- **AAudio**: `SupportedBufferSize` now reports `min: 1`.
+- **ALSA**: Device disconnection now stops the stream with `ErrorKind::DeviceNotAvailable`.
+- **ALSA**: Polling errors trigger underrun recovery instead of looping.
+- **ALSA**: Try to resume from hardware after a system suspend.
+- **ALSA**: Loop partial reads and writes to completion.
+- **ALSA**: Prevent reentrancy issues with non-reentrant plugins and devices.
+- **ASIO**: `Device::driver`, `asio_streams`, and `current_callback_flag` are no longer `pub`.
+- **ASIO**: Timestamps now include driver-reported hardware latency.
+- **ASIO**: Hardware latency is now re-queried when the driver reports `kAsioLatenciesChanged`.
+- **ASIO**: Stream error callback now receives `ErrorKind::Xrun` on `kAsioResyncRequest`.
+- **ASIO**: Stream error callback now receives `ErrorKind::StreamInvalidated` when the driver
+  reports a sample rate change (`sampleRateDidChange`) of 1 Hz or more from the configured rate.
+- **AudioWorklet**: `BufferSize::Fixed` now sets `renderSizeHint` on the `AudioContext`.
+- **CoreAudio**: Bump MSRV to 1.85.
+- **CoreAudio**: Bump `mach2` to 0.6 (uses `core::ffi` instead of `libc`, enables tvOS builds).
+- **CoreAudio**: Timestamps now include device latency and safety offset.
+- **CoreAudio**: Physical stream format is now set directly on the hardware device.
+- **CoreAudio**: Stream error callback now receives `ErrorKind::StreamInvalidated` on any sample
+  rate change on macOS, and on iOS on route changes that require a stream rebuild.
+- **CoreAudio**: Stream error callback now receives `ErrorKind::DeviceNotAvailable` on iOS
+  when media services are lost.
+- **CoreAudio**: User timeouts are now respected when building a stream.
+- **JACK**: Timestamps now use the precise hardware deadline.
+- **JACK**: Buffer size change no longer fires an error callback; internal buffers are resized
+  without error.
+- **JACK**: Server shutdown now fires `ErrorKind::DeviceNotAvailable`.
+- **JACK**: Default client name now includes the process PID.
+- **JACK**: User timeouts are now respected when building a stream.
+- **Linux/BSD**: Default host in order from first to last available now is: PipeWire, PulseAudio,
+  ALSA.
+- **WASAPI**: Timestamps now include hardware pipeline latency.
+- **WASAPI**: `FriendlyName` is now preferred as device name over `DeviceDesc`.
+- **WebAudio**: Bump MSRV to 1.85.
+- **WebAudio**: Timestamps now include base and output latency.
+- **WebAudio**: Initial buffer scheduling offset now scales with buffer duration.
+
+### Removed
+
+- Replaced `StreamInstant::add()` and `sub()` by `checked_add()`/`+` and `checked_sub()`/`-`.
+- **Emscripten**: Removed broken host; use the WebAudio host instead.
+
+### Fixed
+
+- Reintroduce `audio_thread_priority` feature.
+- Fix numeric overflows in calls to create `StreamInstant` in ASIO, CoreAudio and JACK.
+- **AAudio**: Fix thread lock when a stream is dropped before it fully starts.
+- **AAudio**: Fix capture and playback timestamps falling back to time-zero on error.
+- **AAudio**: Fix capture and playback timestamp not accounting for audio pipeline buffer depth.
+- **AAudio**: Fix overflow in `buffer_capacity_in_frames` for large fixed buffer sizes.
+- **AAudio**: Poisoned stream locks now return `ErrorKind::StreamInvalidated` instead of panicking.
+- **AAudio**: Output buffers are now zero-filled before the callback runs.
+- **ALSA**: Fix capture stream hanging or spinning on overruns.
+- **ALSA**: Fix non-monotonic `StreamInstant` during stream startup.
+- **ALSA**: Fix spurious timestamp errors during stream startup.
+- **ALSA**: Fix spurious timeout errors during polling.
+- **ALSA**: Fix rare panics when dropping the stream is interrupted.
+- **ALSA**: Fix timestamp overflows on 32-bit platforms.
+- **ALSA**: Fix overflow in `buffer_capacity_in_frames` for large fixed buffer sizes.
+- **ALSA**: Fix silence template not being applied for DSD.
+- **ASIO**: Fix enumeration returning only the first device when using `collect()`.
+- **ASIO**: Fix device enumeration and stream creation failing when called from spawned threads.
+- **ASIO**: Fix buffer size not resizing when the driver reports `kAsioBufferSizeChange`.
+- **ASIO**: Fix latency not updating when the driver reports `kAsioLatenciesChanged`.
+- **ASIO**: Fix distortion when buggy drivers fire the buffer callback multiple times per cycle.
+- **ASIO**: Poisoned error callback mutex no longer silently drops subsequent error notifications.
+- **ASIO**: Poisoned stream mutex in the buffer-size change handler no longer silently skips the
+  update.
+- **ASIO**: Poisoned stream locks now return `ErrorKind::StreamInvalidated` instead of panicking.
+- **ASIO**: Output buffers are now zero-filled before the callback runs.
+- **CoreAudio**: Fix undefined behaviour and silent failure in loopback device creation.
+- **CoreAudio**: Poisoned stream locks now return `ErrorKind::StreamInvalidated` instead of 
+  panicking.
+- **JACK**: Fix input capture timestamp using callback execution time instead of cycle start.
+- **JACK**: Poisoned error callback mutex no longer silently drops subsequent error notifications.
+- **PulseAudio**: Poisoned locks now exit the thread gracefully instead of panicking.
+- **JACK**: Port registration failure now fails stream creation instead of silently failing.
+- **JACK**: `activate_async()` failure now returns an error instead of panicking.
+- **JACK**: Sample rate is now validated against the live JACK server at stream creation time.
+- **JACK**: Underrun notification no longer blocks the notification thread.
+- **JACK**: Output buffers are now zero-filled before the callback runs.
+- **WASAPI**: Poisoned locks now returns an error instead of panicking.
+- **WASAPI**: Output buffers are now zero-filled before the callback runs.
+- **WebAudio**: Fix duplicated callbacks on repeated `play()` calls.
+- **WebAudio**: Report errors through the callback instead of panicking.
+
+## [0.17.3] - 2026-02-18
+
+### Changed
+
+- Reverted SemVer-breaking `DeviceBusy` error variant addition.
+
+### Fixed
+
+- **ASIO**: Fix linker errors.
+
+## [0.17.2] - 2026-02-08 [YANKED]
+
+### Added
+
+- `DeviceBusy` error variant for retriable device access errors (EBUSY, EAGAIN).
+- **ALSA**: `Debug` implementations for `Host`, `Device`, `Stream`, and internal types.
+- **ALSA**: Example demonstrating ALSA error suppression during enumeration.
+- **ALSA**: Support for native DSD playback.
+- **WASAPI**: Enable as-necessary resampling in the WASAPI server process.
+
+### Changed
+
+- Bump overall MSRV to 1.78.
+- **ALSA**: Update `alsa` dependency to 0.11.
+- **ALSA**: Bump MSRV to 1.82.
+- **CoreAudio**: Update `core-audio-rs` dependency to 0.14.
+
+### Fixed
+
+- **ALSA**: Enumerating input and output devices no longer interferes with each other.
+- **ALSA**: Device handles are no longer exclusively held between operations.
+- **ALSA**: Reduce Valgrind memory leak reports from ALSA global configuration cache.
+- **ALSA**: Fix possible race condition on drop.
+- **ALSA**: Fix audio callback stalling when start threshold is not met.
+
+## [0.17.1] - 2026-01-04
+
+### Added
+
 - **ALSA**: `Default` implementation for `Device` (returns the ALSA "default" device).
+- **CI**: Checks default/no-default/all feature sets with platform-dependent MSRV for JACK.
+
+### Changed
+
+- **ALSA**: Devices now report direction from hint metadata and physical hardware probing.
 
 ### Fixed
 
 - **ALSA**: Device enumeration now includes both hints and physical cards.
-
-### Changed
-- **ALSA**: Devices now report direction from hint metadata and physical hardware probing.
+- **JACK**: No longer builds on iOS.
+- **WASM**: WasmBindgen no longer crashes (regression from 0.17.0).
 
 ## [0.17.0] - 2025-12-20
 
@@ -1029,6 +1189,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial commit.
 
+[Unreleased]: https://github.com/RustAudio/cpal/compare/v0.17.3...HEAD
+[0.17.3]: https://github.com/RustAudio/cpal/compare/v0.17.2...v0.17.3
+[0.17.2]: https://github.com/RustAudio/cpal/compare/v0.17.1...v0.17.2
+[0.17.1]: https://github.com/RustAudio/cpal/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/RustAudio/cpal/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/RustAudio/cpal/compare/v0.15.3...v0.16.0
 [0.15.3]: https://github.com/RustAudio/cpal/compare/v0.15.2...v0.15.3
