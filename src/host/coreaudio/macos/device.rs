@@ -1,6 +1,7 @@
 use std::{
+    ffi::c_void,
     fmt,
-    mem::{self, size_of},
+    mem::{self, size_of, ManuallyDrop},
     ptr::{null, NonNull},
     sync::{
         mpsc::{channel, RecvTimeoutError},
@@ -19,7 +20,9 @@ use coreaudio::audio_unit::{
     AudioUnit, Element, SampleFormat as CoreAudioSampleFormat, Scope, StreamFormat,
 };
 use objc2_audio_toolbox::{
-    kAudioOutputUnitProperty_CurrentDevice, kAudioUnitProperty_StreamFormat,
+    kAudioOutputUnitProperty_CurrentDevice, kAudioOutputUnitProperty_EnableIO,
+    kAudioUnitProperty_SetRenderCallback, kAudioUnitProperty_StreamFormat, AURenderCallbackStruct,
+    AudioUnitRender, AudioUnitRenderActionFlags,
 };
 use objc2_core_audio::{
     kAudioAggregateDeviceClassID, kAudioDevicePropertyAvailableNominalSampleRates,
@@ -34,14 +37,16 @@ use objc2_core_audio::{
     AudioObjectPropertyScope, AudioObjectSetPropertyData,
 };
 use objc2_core_audio_types::{
-    AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioValueRange,
+    kAudio_ParamError, AudioBuffer, AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp,
+    AudioValueRange,
 };
 use objc2_core_foundation::{CFString, Type};
 
+use super::duplex::{duplex_input_proc, DuplexProcWrapper};
 pub use super::enumerate::{SupportedInputConfigs, SupportedOutputConfigs};
 use super::{
     asbd_from_config, check_os_status, host_time_to_stream_instant, DefaultOutputMonitor,
-    DisconnectManager, Monitor, Stream,
+    DisconnectManager, DuplexCallbackPtr, Monitor, Stream,
 };
 use crate::{
     host::{
@@ -49,10 +54,11 @@ use crate::{
         frames_to_duration, try_emit_error, ErrorCallbackArc,
     },
     traits::DeviceTrait,
-    BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId, Error,
-    ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp, InterfaceType,
-    OutputCallbackInfo, OutputStreamTimestamp, ResultExt, SampleFormat, SampleRate, StreamConfig,
-    StreamInstant, SupportedBufferSize, SupportedStreamConfig, SupportedStreamConfigRange,
+    BufferSize, ChannelCount, Data, DeviceDescription, DeviceDescriptionBuilder, DeviceId,
+    DuplexCallbackInfo, DuplexStreamConfig, Error, ErrorKind, FrameCount, InputCallbackInfo,
+    InputStreamTimestamp, InterfaceType, OutputCallbackInfo, OutputStreamTimestamp, ResultExt,
+    SampleFormat, SampleRate, StreamConfig, StreamInstant, SupportedBufferSize,
+    SupportedStreamConfig, SupportedStreamConfigRange,
 };
 
 /// Try to find a matching physical stream format on the device and apply it.
@@ -282,6 +288,51 @@ fn get_io_buffer_frame_size_range(device_id: AudioDeviceID) -> Result<SupportedB
     })
 }
 
+/// Compute the capture-side timestamp from a callback instant and the input latency.
+///
+/// Falls back to `callback` and reports a [`ErrorKind::BackendError`] via `error_callback` if
+/// `callback - delay` would underflow. `callback` is a monotonic clock that starts before the
+/// stream opens, so underflow indicates a pathological latency value and should not happen in
+/// practice.
+pub(super) fn estimate_capture_instant(
+    callback: StreamInstant,
+    delay: Duration,
+    error_callback: &ErrorCallbackArc,
+) -> StreamInstant {
+    callback.checked_sub(delay).unwrap_or_else(|| {
+        let _ = try_emit_error(
+            error_callback,
+            Error::with_message(
+                ErrorKind::BackendError,
+                "timestamp underflow computing capture instant",
+            ),
+        );
+        callback
+    })
+}
+
+/// Compute the playback-side timestamp from a callback instant and the output latency.
+///
+/// Falls back to `callback` and reports a [`ErrorKind::BackendError`] via `error_callback` if
+/// `callback + delay` would overflow. The representation supports ~585 billion years of stream
+/// uptime, so overflow indicates a pathological latency value and should not happen in practice.
+pub(super) fn estimate_playback_instant(
+    callback: StreamInstant,
+    delay: Duration,
+    error_callback: &ErrorCallbackArc,
+) -> StreamInstant {
+    callback.checked_add(delay).unwrap_or_else(|| {
+        let _ = try_emit_error(
+            error_callback,
+            Error::with_message(
+                ErrorKind::BackendError,
+                "timestamp overflow computing playback instant",
+            ),
+        );
+        callback
+    })
+}
+
 impl DeviceTrait for Device {
     type SupportedInputConfigs = SupportedInputConfigs;
     type SupportedOutputConfigs = SupportedOutputConfigs;
@@ -346,6 +397,41 @@ impl DeviceTrait for Device {
         E: FnMut(Error) + Send + 'static,
     {
         Device::build_output_stream_raw(
+            self,
+            config,
+            sample_format,
+            data_callback,
+            error_callback,
+            timeout,
+        )
+    }
+
+    fn supports_duplex(&self) -> bool {
+        // Any `AudioDeviceID` that exposes both directions can be driven by a single HALOutput
+        // AudioUnit, which delivers input and output to one render callback.
+        //
+        // For non-aggregate devices the clock is shared by construction (one piece of hardware).
+        // For aggregate devices, CoreAudio drift-corrects across sub-device clocks — drift
+        // correction is configured per-aggregate in Audio MIDI Setup and is enabled by default.
+        // The resulting callback is sample-aligned (any drift between physical clocks is
+        // absorbed by the aggregate). We trust that user-configured aggregates are what the
+        // user wants and accept them here.
+        self.supports_input() && self.supports_output()
+    }
+
+    fn build_duplex_stream_raw<D, E>(
+        &self,
+        config: DuplexStreamConfig,
+        sample_format: SampleFormat,
+        data_callback: D,
+        error_callback: E,
+        timeout: Option<Duration>,
+    ) -> Result<Self::Stream, Error>
+    where
+        D: FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        Device::build_duplex_stream_raw(
             self,
             config,
             sample_format,
@@ -782,7 +868,7 @@ impl Device {
             let latency_frames =
                 device_buffer_frames.unwrap_or(buffer_frames) + extra_latency_frames;
             let delay = frames_to_duration(latency_frames as FrameCount, sample_rate);
-            let capture = callback.checked_sub(delay).unwrap_or(StreamInstant::ZERO);
+            let capture = estimate_capture_instant(callback, delay, &error_callback);
             let timestamp = InputStreamTimestamp { callback, capture };
 
             let info = InputCallbackInfo { timestamp };
@@ -796,15 +882,17 @@ impl Device {
 
         let inner_arc = Arc::new(Mutex::new(StreamInner {
             playing: false,
-            audio_unit,
+            audio_unit: ManuallyDrop::new(audio_unit),
             _device_id: self.audio_device_id,
             _loopback_device: loopback_aggregate,
+            duplex_callback_ptr: None,
         }));
         let weak_inner = Arc::downgrade(&inner_arc);
         let monitor: Box<dyn Monitor> = Box::new(DisconnectManager::new(
             self.audio_device_id,
             weak_inner,
             error_callback_disconnect,
+            false,
         )?);
         let stream = Stream::new(inner_arc, monitor);
         stream.signal_ready();
@@ -894,7 +982,7 @@ impl Device {
             let latency_frames =
                 device_buffer_frames.unwrap_or(buffer_frames) + extra_latency_frames;
             let delay = frames_to_duration(latency_frames as FrameCount, sample_rate);
-            let playback = callback + delay;
+            let playback = estimate_playback_instant(callback, delay, &error_callback_for_render);
             let timestamp = OutputStreamTimestamp { callback, playback };
 
             let info = OutputCallbackInfo { timestamp };
@@ -908,9 +996,10 @@ impl Device {
 
         let inner_arc = Arc::new(Mutex::new(StreamInner {
             playing: false,
-            audio_unit,
+            audio_unit: ManuallyDrop::new(audio_unit),
             _device_id: self.audio_device_id,
             _loopback_device: None,
+            duplex_callback_ptr: None,
         }));
         let weak_inner = Arc::downgrade(&inner_arc);
         let monitor: Box<dyn Monitor> = if matches!(mode, AudioUnitMode::DefaultOutput) {
@@ -920,8 +1009,288 @@ impl Device {
                 self.audio_device_id,
                 weak_inner,
                 error_callback,
+                false,
             )?)
         };
+        let stream = Stream::new(inner_arc, monitor);
+        stream.signal_ready();
+        Ok(stream)
+    }
+
+    /// Build a synchronized duplex stream on a single HALOutput AudioUnit.
+    ///
+    /// Both directions share the same hardware callback so input and output are sample-aligned.
+    /// `coreaudio-rs` does not expose a builder for this case, so we drive the AudioUnit setup
+    /// directly here and register the render callback via [`duplex_input_proc`].
+    pub(super) fn build_duplex_stream_raw<D, E>(
+        &self,
+        config: DuplexStreamConfig,
+        sample_format: SampleFormat,
+        mut data_callback: D,
+        error_callback: E,
+        timeout: Option<Duration>,
+    ) -> Result<Stream, Error>
+    where
+        D: FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        if !(self.supports_input() && self.supports_output()) {
+            return Err(Error::with_message(
+                ErrorKind::UnsupportedOperation,
+                "device does not support both input and output",
+            ));
+        }
+
+        set_sample_rate(self.audio_device_id, config.sample_rate, timeout)?;
+
+        // HALOutput with both directions enabled. We pin the device explicitly rather than
+        // following the system default — duplex callers care about which device they are on.
+        let mut audio_unit =
+            AudioUnit::new_uninitialized(coreaudio::audio_unit::IOType::HalOutput)?;
+
+        // Enable IO on both buses. `kAudioOutputUnitProperty_EnableIO` is a 0/1 toggle.
+        const ENABLED: u32 = 1;
+        audio_unit.set_property(
+            kAudioOutputUnitProperty_EnableIO,
+            Scope::Input,
+            Element::Input,
+            Some(&ENABLED),
+        )?;
+        audio_unit.set_property(
+            kAudioOutputUnitProperty_EnableIO,
+            Scope::Output,
+            Element::Output,
+            Some(&ENABLED),
+        )?;
+
+        // Pin the device.
+        audio_unit.set_property(
+            kAudioOutputUnitProperty_CurrentDevice,
+            Scope::Global,
+            Element::Output,
+            Some(&self.audio_device_id),
+        )?;
+
+        // Client-side format. Note the inverted scopes — the input bus's *output* side is what
+        // the client reads; the output bus's *input* side is what the client writes. Easy to get
+        // backwards.
+        let input_config = StreamConfig {
+            channels: config.input_channels,
+            sample_rate: config.sample_rate,
+            buffer_size: config.buffer_size,
+        };
+        let output_config = StreamConfig {
+            channels: config.output_channels,
+            sample_rate: config.sample_rate,
+            buffer_size: config.buffer_size,
+        };
+        let input_asbd = asbd_from_config(input_config, sample_format);
+        audio_unit.set_property(
+            kAudioUnitProperty_StreamFormat,
+            Scope::Output,
+            Element::Input,
+            Some(&input_asbd),
+        )?;
+        let output_asbd = asbd_from_config(output_config, sample_format);
+        audio_unit.set_property(
+            kAudioUnitProperty_StreamFormat,
+            Scope::Input,
+            Element::Output,
+            Some(&output_asbd),
+        )?;
+
+        // Apply the requested fixed buffer size (device-level property).
+        if let BufferSize::Fixed(frames) = config.buffer_size {
+            audio_unit.set_property(
+                kAudioDevicePropertyBufferFrameSize,
+                Scope::Global,
+                Element::Output,
+                Some(&frames),
+            )?;
+        }
+
+        audio_unit.initialize()?;
+
+        // Snapshot of the values the audio callback needs without holding the AudioUnit.
+        let sample_rate = config.sample_rate;
+        let device_buffer_frames = get_device_buffer_frame_size(&audio_unit).map_err(|e| {
+            Error::with_message(
+                ErrorKind::BackendError,
+                format!("failed to query device buffer size: {e}"),
+            )
+        })?;
+        let input_channels = config.input_channels as usize;
+        let sample_bytes = sample_format.sample_size();
+        let input_buffer_bytes = device_buffer_frames * input_channels * sample_bytes;
+        let mut input_buffer: Box<[u8]> = vec![0u8; input_buffer_bytes].into_boxed_slice();
+
+        // Raw AudioUnit handle for `AudioUnitRender` calls from inside the closure. The
+        // pointer (`*mut OpaqueAudioComponentInstance`) isn't `Send`, but `DuplexProcFn` does
+        // not require `Send` either — Send-ness is asserted at the `DuplexProcWrapper` level,
+        // see its safety doc.
+        let raw_audio_unit = *audio_unit.as_ref();
+
+        let error_callback: ErrorCallbackArc = Arc::new(Mutex::new(error_callback));
+        let error_callback_for_callback = error_callback.clone();
+
+        // Once tripped, every subsequent callback bails. The `DisconnectManager` (configured
+        // below with `listen_buffer_size = true`) also fires `StreamInvalidated` on the
+        // property listener thread; this is the race guard for callbacks that fire *before*
+        // the manager pauses us.
+        let buffer_size_changed = std::sync::atomic::AtomicBool::new(false);
+
+        let duplex_proc: Box<super::duplex::DuplexProcFn> = Box::new(
+            move |io_action_flags: NonNull<AudioUnitRenderActionFlags>,
+                  in_time_stamp: NonNull<AudioTimeStamp>,
+                  _in_bus_number: u32,
+                  in_number_frames: u32,
+                  io_data: *mut AudioBufferList|
+                  -> i32 {
+                use std::sync::atomic::Ordering;
+
+                if buffer_size_changed.load(Ordering::Relaxed) {
+                    return kAudio_ParamError;
+                }
+
+                if io_data.is_null() {
+                    return kAudio_ParamError;
+                }
+                // SAFETY: io_data is non-null per the check above; CoreAudio guarantees
+                // validity for the callback duration.
+                let buffer_list = unsafe { &mut *io_data };
+                if buffer_list.mNumberBuffers == 0 {
+                    return kAudio_ParamError;
+                }
+
+                let num_frames = in_number_frames as usize;
+                let input_samples = num_frames * input_channels;
+                let input_bytes = input_samples * sample_bytes;
+                if input_bytes != input_buffer.len() {
+                    buffer_size_changed.store(true, Ordering::Relaxed);
+                    return kAudio_ParamError;
+                }
+
+                // SAFETY: in_time_stamp is valid per the CoreAudio callback contract.
+                let timestamp: &AudioTimeStamp = unsafe { in_time_stamp.as_ref() };
+                let callback = match host_time_to_stream_instant(timestamp.mHostTime) {
+                    Ok(t) => t,
+                    Err(err) => {
+                        let _ = try_emit_error(&error_callback_for_callback, err);
+                        return kAudio_ParamError;
+                    }
+                };
+                let delay = frames_to_duration(device_buffer_frames as FrameCount, sample_rate);
+                let capture =
+                    estimate_capture_instant(callback, delay, &error_callback_for_callback);
+                let playback =
+                    estimate_playback_instant(callback, delay, &error_callback_for_callback);
+                let input_timestamp = InputStreamTimestamp { callback, capture };
+                let output_timestamp = OutputStreamTimestamp { callback, playback };
+
+                // Output side: write directly into CoreAudio's first buffer.
+                let output_buf = &mut buffer_list.mBuffers[0];
+                if output_buf.mData.is_null() {
+                    return kAudio_ParamError;
+                }
+                let output_samples = output_buf.mDataByteSize as usize / sample_bytes;
+                // SAFETY: output_buf.mData is non-null per the check above and points to a
+                // buffer of mDataByteSize bytes for the callback duration.
+                let mut output_data = unsafe {
+                    Data::from_parts(output_buf.mData as *mut (), output_samples, sample_format)
+                };
+
+                // Input side: pull from the input bus into our scratch buffer.
+                let mut input_buffer_list = AudioBufferList {
+                    mNumberBuffers: 1,
+                    mBuffers: [AudioBuffer {
+                        mNumberChannels: input_channels as u32,
+                        mDataByteSize: input_bytes as u32,
+                        mData: input_buffer.as_mut_ptr() as *mut c_void,
+                    }],
+                };
+                // SAFETY: raw_audio_unit is valid for the callback's lifetime;
+                // input_buffer_list and input_buffer are alive on the stack/heap here.
+                let status = unsafe {
+                    AudioUnitRender(
+                        raw_audio_unit,
+                        io_action_flags.as_ptr(),
+                        in_time_stamp,
+                        1, // element 1 == input bus
+                        in_number_frames,
+                        NonNull::new_unchecked(&mut input_buffer_list),
+                    )
+                };
+                if status != 0 {
+                    let _ = try_emit_error(
+                        &error_callback_for_callback,
+                        Error::with_message(
+                            ErrorKind::BackendError,
+                            format!("AudioUnitRender (input) returned OSStatus {status}"),
+                        ),
+                    );
+                    // Zero the buffer so the user callback sees silence rather than stale data.
+                    input_buffer[..input_bytes].fill(0);
+                }
+
+                // SAFETY: input_buffer is bounds-checked, was just filled (or zeroed) by
+                // `AudioUnitRender`, and outlives this `Data` reference (it's owned by the
+                // closure, which outlives this invocation).
+                let input_data = unsafe {
+                    Data::from_parts(
+                        input_buffer.as_mut_ptr() as *mut (),
+                        input_samples,
+                        sample_format,
+                    )
+                };
+
+                let info = DuplexCallbackInfo::new(input_timestamp, output_timestamp);
+                data_callback(&input_data, &mut output_data, &info);
+
+                0
+            },
+        );
+
+        // Box up the wrapper and hand the raw pointer to CoreAudio. Reclaimed in `Drop for
+        // StreamInner` after the audio unit is stopped.
+        let wrapper = Box::new(DuplexProcWrapper {
+            callback: duplex_proc,
+        });
+        let wrapper_ptr = Box::into_raw(wrapper);
+
+        let render_callback = AURenderCallbackStruct {
+            inputProc: Some(duplex_input_proc),
+            inputProcRefCon: wrapper_ptr as *mut c_void,
+        };
+        audio_unit.set_property(
+            kAudioUnitProperty_SetRenderCallback,
+            Scope::Global,
+            Element::Output,
+            Some(&render_callback),
+        )?;
+
+        let inner_arc = Arc::new(Mutex::new(StreamInner {
+            playing: false,
+            audio_unit: ManuallyDrop::new(audio_unit),
+            _device_id: self.audio_device_id,
+            _loopback_device: None,
+            duplex_callback_ptr: Some(DuplexCallbackPtr(wrapper_ptr)),
+        }));
+        let weak_inner = Arc::downgrade(&inner_arc);
+        let monitor: Box<dyn Monitor> = Box::new(DisconnectManager::new(
+            self.audio_device_id,
+            weak_inner,
+            error_callback,
+            true,
+        )?);
+
+        // Start the audio unit. The user calls `Stream::play` to begin processing later, but
+        // following the existing input/output paths we start the unit here while still in the
+        // build function so failures surface synchronously.
+        inner_arc
+            .lock()
+            .map_err(|_| Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned"))?
+            .play()?;
+
         let stream = Stream::new(inner_arc, monitor);
         stream.signal_ready();
         Ok(stream)
