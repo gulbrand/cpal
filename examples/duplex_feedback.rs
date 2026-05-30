@@ -1,14 +1,4 @@
-//! Feeds the captured input straight back to the output through a duplex stream.
-//!
-//! A duplex stream pairs the two directions on the same device callback, so the captured and
-//! rendered frames share a hardware clock. Unlike `feedback.rs` (which uses separate input/output
-//! streams glued together with a ring buffer), this example does not need any cross-stream
-//! buffering — the data callback receives the just-captured frame and writes the next-to-render
-//! frame in the same call.
-//!
-//! Duplex support is host-specific. Today only the CoreAudio (macOS) host implements it, so the
-//! actual body lives inside a `#[cfg(target_os = "macos")]` `mod imp`; on other targets `main`
-//! prints a friendly message and exits.
+// Duplex feedback example.
 
 #[cfg(target_os = "macos")]
 mod imp {
