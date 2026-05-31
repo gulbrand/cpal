@@ -16,7 +16,7 @@ mod imp {
         list: bool,
 
         /// Device ID to use for the duplex stream. If omitted, the default output device is
-        /// used. Run with `--list` to see candidate IDs.
+        /// used.
         #[arg(short, long, value_name = "ID")]
         device: Option<String>,
 
@@ -86,39 +86,18 @@ mod imp {
             input_channels: opt.input_channels,
             output_channels: opt.output_channels,
             sample_rate: opt.sample_rate,
-            buffer_size: match opt.buffer_size {
-                Some(frames) => BufferSize::Fixed(frames),
-                None => BufferSize::Default,
-            },
+            buffer_size: opt
+                .buffer_size
+                .map_or(BufferSize::Default, BufferSize::Fixed),
         };
 
-        let input_channels = opt.input_channels as usize;
-        let output_channels = opt.output_channels as usize;
+        let input_channels = opt.input_channels;
+        let output_channels = opt.output_channels;
 
         let stream = device.build_duplex_stream::<f32, _, _>(
             config,
             move |input, output, _info| {
-                let input_frames = input.len() / input_channels.max(1);
-                let output_frames = output.len() / output_channels.max(1);
-                let frames = input_frames.min(output_frames);
-
-                for frame in 0..frames {
-                    // Mix the input channels into a single mono sample and broadcast it to all
-                    // output channels.
-                    let mut acc = 0.0f32;
-                    for ch in 0..input_channels {
-                        acc += input[frame * input_channels + ch];
-                    }
-                    let mixed = acc / input_channels.max(1) as f32;
-                    for ch in 0..output_channels {
-                        output[frame * output_channels + ch] = mixed;
-                    }
-                }
-
-                // Any output samples beyond the captured frames get silence.
-                for sample in output.iter_mut().skip(frames * output_channels) {
-                    *sample = f32::EQUILIBRIUM;
-                }
+                mix_to_output(input, output, input_channels, output_channels)
             },
             |err| eprintln!("duplex stream error: {err}"),
             None,
@@ -131,33 +110,61 @@ mod imp {
         Ok(())
     }
 
+    /// Mix interleaved input frames to mono and broadcast across all output channels,
+    /// padding any trailing output samples with silence.
+    fn mix_to_output(
+        input: &[f32],
+        output: &mut [f32],
+        input_channels: ChannelCount,
+        output_channels: ChannelCount,
+    ) {
+        let input_channels = input_channels as usize;
+        let output_channels = output_channels as usize;
+        let input_frames = input.len() / input_channels.max(1);
+        let output_frames = output.len() / output_channels.max(1);
+        let frames = input_frames.min(output_frames);
+
+        for frame in 0..frames {
+            let mut acc = f32::EQUILIBRIUM;
+            for ch in 0..input_channels {
+                acc += input[frame * input_channels + ch];
+            }
+            let mixed = acc / input_channels.max(1) as f32;
+            for ch in 0..output_channels {
+                output[frame * output_channels + ch] = mixed;
+            }
+        }
+
+        output[frames * output_channels..].fill(f32::EQUILIBRIUM);
+    }
+
     /// Print the devices on the active host that report `supports_duplex() == true`, with their
     /// IDs (for use with `--device`) and descriptions.
     fn list_duplex_devices(host: &cpal::Host) -> Result<(), cpal::Error> {
         let default_id = host.default_output_device().and_then(|d| d.id().ok());
 
-        let mut found = 0usize;
+        let mut found = false;
         println!("Devices supporting duplex on this host:");
         for device in host.devices()? {
             if !device.supports_duplex() {
                 continue;
             }
-            found += 1;
+            found = true;
             let id = device.id().ok();
             let name = device
                 .description()
-                .map(|d| d.name().to_string())
-                .unwrap_or_else(|_| "<unknown>".to_string());
-            let default_marker = match (&id, &default_id) {
-                (Some(a), Some(b)) if a == b => " [default]",
-                _ => "",
+                .map_or_else(|_| "<unknown>".to_string(), |d| d.name().to_string());
+            let default_marker = if id.is_some() && id == default_id {
+                " [default]"
+            } else {
+                ""
             };
-            match id {
-                Some(id) => println!("  {id}{default_marker}  —  {name}"),
-                None => println!("  <no id>{default_marker}  —  {name}"),
-            }
+            let id_str = id
+                .as_ref()
+                .map_or_else(|| "<no id>".to_string(), ToString::to_string);
+            println!("  {id_str}{default_marker}  —  {name}");
         }
-        if found == 0 {
+        if found {
             println!("  (none)");
         }
         Ok(())
