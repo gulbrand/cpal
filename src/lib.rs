@@ -184,7 +184,7 @@ pub use sample_format::{FromSample, Sample, SampleFormat, SizedSample, I24, U24}
 use wasm_bindgen::prelude::*;
 
 pub mod device_description;
-pub mod duplex;
+mod duplex;
 mod error;
 mod host;
 pub mod platform;

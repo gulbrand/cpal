@@ -22,11 +22,11 @@ use super::{
     asbd_from_config, host_time_to_stream_instant, DisconnectManager, DuplexCallbackPtr, Monitor,
     Stream, StreamInner,
 };
-use crate::duplex::DuplexCallbackInfo;
 use crate::host::{frames_to_duration, try_emit_error, ErrorCallbackArc};
 use crate::traits::DeviceTrait;
 use crate::{
-    BufferSize, Data, DuplexStreamConfig, Error, ErrorKind, FrameCount, InputStreamTimestamp,
+    BufferSize, Data, DuplexCallbackInfo, DuplexStreamConfig, Error, ErrorKind, FrameCount,
+    InputStreamTimestamp,
     OutputStreamTimestamp, SampleFormat, StreamConfig,
 };
 
