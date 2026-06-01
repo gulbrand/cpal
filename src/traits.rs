@@ -163,7 +163,7 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
     }
 
     /// True if the device can build a synchronized duplex stream where the captured input and
-    /// rendered output share a single hardware clock.
+    /// rendered output share a single clock.
     ///
     /// Returning `true` is a contract that input and output sides will run from one device-level
     /// callback, or an OS driver aggregate (such as an Aggregate Device on MacOS).
