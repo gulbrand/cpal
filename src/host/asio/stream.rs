@@ -17,9 +17,9 @@ use crate::{
         error_emit::{emit_error, try_emit_error},
         frames_to_duration,
     },
-    BufferSize, Data, Error, ErrorKind, FrameCount, InputCallbackInfo, InputStreamTimestamp,
-    OutputCallbackInfo, OutputStreamTimestamp, SampleFormat, SampleRate, StreamConfig,
-    StreamInstant, I24,
+    BufferSize, Data, DuplexCallbackInfo, DuplexStreamConfig, Error, ErrorKind, FrameCount,
+    InputCallbackInfo, InputStreamTimestamp, OutputCallbackInfo, OutputStreamTimestamp,
+    SampleFormat, SampleRate, StreamConfig, StreamInstant, I24,
 };
 
 /// Shared state for extending the 32-bit `timeGetTime()` millisecond counter into a
@@ -73,6 +73,16 @@ impl StreamState {
     fn store(self, atom: &AtomicU8, order: Ordering) {
         atom.store(self as u8, order);
     }
+}
+
+/// The hardware-latency atomics that a driver event callback should keep up to date.
+///
+/// Input- and output-only streams populate a single field; a duplex stream populates both so a
+/// single `kAsioLatenciesChanged` event refreshes the latency for each direction.
+#[derive(Default, Clone)]
+struct LatencyTargets {
+    input: Option<Arc<AtomicU32>>,
+    output: Option<Arc<AtomicU32>>,
 }
 
 pub struct Stream {
@@ -189,8 +199,10 @@ impl Device {
             .add_event_callback(
                 &driver,
                 error_callback,
-                Arc::clone(&hardware_input_latency),
-                true,
+                LatencyTargets {
+                    input: Some(Arc::clone(&hardware_input_latency)),
+                    output: None,
+                },
                 Arc::clone(&state),
             )
             .inspect_err(|_| {
@@ -523,8 +535,10 @@ impl Device {
             .add_event_callback(
                 &driver,
                 error_callback,
-                Arc::clone(&hardware_output_latency),
-                false,
+                LatencyTargets {
+                    input: None,
+                    output: Some(Arc::clone(&hardware_output_latency)),
+                },
                 Arc::clone(&state),
             )
             .inspect_err(|_| {
@@ -837,6 +851,260 @@ impl Device {
         })
     }
 
+    /// True if this device can run a synchronized duplex stream.
+    ///
+    /// ASIO drives input and output from a single `bufferSwitch` on one hardware clock, so any
+    /// device that exposes both directions satisfies the duplex contract.
+    pub fn supports_duplex(&self) -> bool {
+        self.channels_in > 0 && self.channels_out > 0
+    }
+
+    pub fn build_duplex_stream_raw<D, E>(
+        &self,
+        config: DuplexStreamConfig,
+        sample_format: SampleFormat,
+        mut data_callback: D,
+        error_callback: E,
+        _timeout: Option<Duration>,
+    ) -> Result<Stream, Error>
+    where
+        D: FnMut(&Data, &mut Data, &DuplexCallbackInfo) + Send + 'static,
+        E: FnMut(Error) + Send + 'static,
+    {
+        if config.input_channels == 0 || config.output_channels == 0 {
+            return Err(Error::with_message(
+                ErrorKind::InvalidInput,
+                "Duplex streams require at least one input and one output channel",
+            ));
+        }
+        com::com_initialized();
+        let description = self.description()?;
+        let driver = super::GLOBAL_ASIO
+            .get()
+            .ok_or_else(|| {
+                Error::with_message(
+                    ErrorKind::DeviceNotAvailable,
+                    "ASIO driver is not initialized",
+                )
+            })?
+            .load_driver(description.name())
+            .map_err(load_driver_err)?;
+
+        // ASIO can report a distinct sample type per direction; both must match the requested
+        // format, since a duplex stream delivers one interleaved buffer type to the user.
+        let input_stream_type = driver.input_data_type().map_err(build_stream_err)?;
+        let output_stream_type = driver.output_data_type().map_err(build_stream_err)?;
+        for (stream_type, direction) in [
+            (&input_stream_type, "Input"),
+            (&output_stream_type, "Output"),
+        ] {
+            let expected = super::device::convert_data_type(stream_type).ok_or_else(|| {
+                Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!("{direction} sample format is not supported"),
+                )
+            })?;
+            if sample_format != expected {
+                return Err(Error::with_message(
+                    ErrorKind::UnsupportedConfig,
+                    format!("Sample format {sample_format} is not supported; expected {expected}"),
+                ));
+            }
+        }
+
+        let input_channels = config.input_channels;
+        let output_channels = config.output_channels;
+        let buffer_size = self.get_or_create_duplex_stream(&driver, &config, sample_format)?;
+
+        // Separate interleaved CPAL buffers for each direction.
+        let mut interleaved_in =
+            vec![0u8; buffer_size * input_channels as usize * sample_format.sample_size()];
+        let mut interleaved_out =
+            vec![0u8; buffer_size * output_channels as usize * sample_format.sample_size()];
+
+        let current_callback_flag = self.current_callback_flag.clone();
+
+        // Query hardware latencies for both directions (order matters: needs buffers created
+        // above). Wrapped in atomics so the event callback can refresh them on
+        // kAsioLatenciesChanged without touching the buffer callback.
+        let latencies = driver.latencies().ok();
+        let hardware_input_latency = Arc::new(AtomicU32::new(
+            latencies
+                .as_ref()
+                .map(|l| l.input.max(0) as u32)
+                .unwrap_or(0),
+        ));
+        let hardware_output_latency = Arc::new(AtomicU32::new(
+            latencies
+                .as_ref()
+                .map(|l| l.output.max(0) as u32)
+                .unwrap_or(0),
+        ));
+
+        let state = Arc::new(AtomicU8::new(StreamState::Starting as u8));
+        let driver_event_callback_id = self
+            .add_event_callback(
+                &driver,
+                error_callback,
+                LatencyTargets {
+                    input: Some(Arc::clone(&hardware_input_latency)),
+                    output: Some(Arc::clone(&hardware_output_latency)),
+                },
+                Arc::clone(&state),
+            )
+            .inspect_err(|_| {
+                // Roll back both streams stored by get_or_create_duplex_stream.
+                if let Ok(mut streams) = self.asio_streams.lock() {
+                    streams.input = None;
+                    streams.output = None;
+                }
+            })?;
+
+        let state_cb = Arc::clone(&state);
+        let asio_streams = self.asio_streams.clone();
+        let sample_rate = config.sample_rate;
+        let mut current_in_buffer_size = buffer_size as i32;
+        let mut current_out_buffer_size = buffer_size as i32;
+        let mut last_buffer_index: i32 = -1;
+
+        let time_base = Arc::new(TimeBase::default());
+        let time_base_cb = Arc::clone(&time_base);
+
+        // The single duplex buffer callback: capture input, hand both buffers to the user on one
+        // clock, then render output — all within one ASIO `bufferSwitch`.
+        let callback_id = driver.add_callback(move |callback_info| unsafe {
+            if StreamState::load(&state_cb, Ordering::Acquire) != StreamState::Playing {
+                return;
+            }
+
+            // Guard against non-conformant drivers that fire multiple times per buffer cycle with
+            // the same buffer index (see the input/output paths).
+            if callback_info.buffer_index == last_buffer_index {
+                return;
+            }
+            last_buffer_index = callback_info.buffer_index;
+
+            // 0% chance of contention: the host only locks when (re)creating streams.
+            let mut stream_lock = asio_streams.lock().unwrap();
+            let streams = &mut *stream_lock;
+            let (in_stream, out_stream) = match (streams.input.as_ref(), streams.output.as_mut()) {
+                (Some(input), Some(output)) => (input, output),
+                // A duplex stream needs both directions present; otherwise do nothing this cycle.
+                _ => return,
+            };
+
+            // Resize the interleaved buffers only when the driver changes its buffer size.
+            // In normal operation these branches are never taken.
+            if in_stream.buffer_size != current_in_buffer_size {
+                current_in_buffer_size = in_stream.buffer_size;
+                interleaved_in.resize(
+                    current_in_buffer_size as usize
+                        * input_channels as usize
+                        * sample_format.sample_size(),
+                    0,
+                );
+            }
+            if out_stream.buffer_size != current_out_buffer_size {
+                current_out_buffer_size = out_stream.buffer_size;
+                interleaved_out.resize(
+                    current_out_buffer_size as usize
+                        * output_channels as usize
+                        * sample_format.sample_size(),
+                    0,
+                );
+            }
+
+            let buffer_index = callback_info.buffer_index as usize;
+            let callback_instant = time_base_cb.to_stream_instant(callback_info.system_time);
+            let input_latency = hardware_input_latency.load(Ordering::Relaxed) as usize;
+            let output_latency = hardware_output_latency.load(Ordering::Relaxed) as usize;
+
+            // 1. Capture: ASIO input channels -> interleaved CPAL input buffer.
+            read_input_to_interleaved(
+                &input_stream_type,
+                sample_format,
+                in_stream,
+                buffer_index,
+                &mut interleaved_in,
+            );
+
+            // 2. Build the shared-clock timestamps and `Data` views.
+            let input_data = Data::from_parts(
+                interleaved_in.as_mut_ptr() as *mut (),
+                interleaved_in.len() / sample_format.sample_size(),
+                sample_format,
+            );
+            // The user fills the output buffer from scratch each cycle.
+            interleaved_out.fill(0);
+            let mut output_data = Data::from_parts(
+                interleaved_out.as_mut_ptr() as *mut (),
+                interleaved_out.len() / sample_format.sample_size(),
+                sample_format,
+            );
+
+            let in_delay = frames_to_duration(input_latency as FrameCount, sample_rate);
+            let out_delay = frames_to_duration(output_latency as FrameCount, sample_rate);
+            let capture = callback_instant
+                .checked_sub(in_delay)
+                .unwrap_or(StreamInstant::ZERO);
+            let playback = callback_instant + out_delay;
+            let info = DuplexCallbackInfo::new(
+                InputStreamTimestamp {
+                    callback: callback_instant,
+                    capture,
+                },
+                OutputStreamTimestamp {
+                    callback: callback_instant,
+                    playback,
+                },
+            );
+
+            // 3. Deliver both buffers to the user in a single synchronized call.
+            data_callback(&input_data, &mut output_data, &info);
+
+            // 4. Render: interleaved CPAL output buffer -> ASIO output channels.
+            //
+            // Mirror the output-only path's per-switch silence handling so the ASIO buffer is
+            // overwritten (not mixed into) the first time it is touched this buffer switch.
+            let silence =
+                current_callback_flag.load(Ordering::Acquire) != callback_info.callback_flag;
+            if silence {
+                current_callback_flag.store(callback_info.callback_flag, Ordering::Release);
+            }
+            write_output_from_interleaved(
+                &output_stream_type,
+                sample_format,
+                out_stream,
+                buffer_index,
+                &interleaved_out,
+                silence,
+            );
+        });
+
+        let driver = Arc::new(driver);
+        let asio_streams = self.asio_streams.clone();
+
+        if let Err(e) = driver.start() {
+            driver.remove_event_callback(driver_event_callback_id);
+            driver.remove_callback(callback_id);
+            if let Ok(mut streams) = asio_streams.lock() {
+                streams.input = None;
+                streams.output = None;
+            }
+            return Err(build_stream_err(e));
+        }
+
+        StreamState::Paused.store(&state, Ordering::Release);
+        Ok(Stream {
+            state,
+            driver,
+            asio_streams,
+            callback_id,
+            driver_event_callback_id,
+            time_base: Arc::clone(&time_base),
+        })
+    }
+
     /// Create a new CPAL Input Stream.
     ///
     /// If there is no existing ASIO Input Stream it will be created.
@@ -923,12 +1191,71 @@ impl Device {
         }
     }
 
+    /// Create the duplex ASIO stream (both input and output) in a single `ASIOCreateBuffers`
+    /// call so the two directions share one buffer switch.
+    ///
+    /// Unlike the input/output paths, duplex always (re)creates both directions together, since
+    /// they must be allocated as one contiguous set of buffers.
+    ///
+    /// On success, the buffer size of the stream is returned.
+    fn get_or_create_duplex_stream(
+        &self,
+        driver: &sys::Driver,
+        config: &DuplexStreamConfig,
+        sample_format: SampleFormat,
+    ) -> Result<usize, Error> {
+        let max_input_channels = self.default_input_config()?.channels;
+        let max_output_channels = self.default_output_config()?.channels;
+
+        // Validate each direction against the shared sample rate and buffer size. `check_config`
+        // also sets the driver sample rate (idempotent across the two calls).
+        let input_config = StreamConfig {
+            channels: config.input_channels,
+            sample_rate: config.sample_rate,
+            buffer_size: config.buffer_size,
+        };
+        let output_config = StreamConfig {
+            channels: config.output_channels,
+            sample_rate: config.sample_rate,
+            buffer_size: config.buffer_size,
+        };
+        crate::validate_stream_config(&input_config)?;
+        crate::validate_stream_config(&output_config)?;
+        check_config(driver, input_config, sample_format, max_input_channels)?;
+        check_config(driver, output_config, sample_format, max_output_channels)?;
+
+        let mut streams = self.asio_streams.lock().map_err(|_| {
+            Error::with_message(ErrorKind::StreamInvalidated, "Stream lock poisoned")
+        })?;
+
+        let buffer_size = match config.buffer_size {
+            BufferSize::Fixed(v) => Some(v as i32),
+            BufferSize::Default => None,
+        };
+
+        let new_streams = driver
+            .prepare_duplex_stream(
+                config.input_channels as usize,
+                config.output_channels as usize,
+                buffer_size,
+            )
+            .map_err(build_stream_err)?;
+        // Input and output share the same buffer size; either is fine.
+        let bs = new_streams
+            .input
+            .as_ref()
+            .or(new_streams.output.as_ref())
+            .expect("prepare_duplex_stream returned neither input nor output")
+            .buffer_size as usize;
+        *streams = new_streams;
+        Ok(bs)
+    }
+
     fn add_event_callback<E>(
         &self,
         driver: &sys::Driver,
         error_callback: E,
-        hardware_latency: Arc<AtomicU32>,
-        is_input: bool,
+        latencies: LatencyTargets,
         state: Arc<AtomicU8>,
     ) -> Result<sys::DriverEventCallbackId, Error>
     where
@@ -1030,27 +1357,28 @@ impl Device {
                         true
                     }
                     sys::AsioMessageSelectors::kAsioLatenciesChanged => {
-                        if let Ok(latencies) = driver_for_latency.latencies() {
-                            let latency = if is_input {
-                                latencies.input
-                            } else {
-                                latencies.output
-                            };
-                            hardware_latency.store(latency.max(0) as u32, Ordering::Relaxed);
+                        if let Ok(reported) = driver_for_latency.latencies() {
+                            if let Some(target) = &latencies.input {
+                                target.store(reported.input.max(0) as u32, Ordering::Relaxed);
+                            }
+                            if let Some(target) = &latencies.output {
+                                target.store(reported.output.max(0) as u32, Ordering::Relaxed);
+                            }
                         }
                         false
                     }
                     sys::AsioMessageSelectors::kAsioBufferSizeChange => {
                         if value > 0 {
+                            // The new buffer size applies to every active direction (input and
+                            // output share a single buffer switch), so update whichever streams
+                            // exist.
                             let mut streams = asio_streams_for_event
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            let stream = if is_input {
-                                streams.input.as_mut()
-                            } else {
-                                streams.output.as_mut()
-                            };
-                            if let Some(s) = stream {
+                            if let Some(s) = streams.input.as_mut() {
+                                s.buffer_size = value;
+                            }
+                            if let Some(s) = streams.output.as_mut() {
                                 s.buffer_size = value;
                             }
                         }
@@ -1446,4 +1774,288 @@ unsafe fn apply_input_callback_to_data<A, D>(
     };
     let info = InputCallbackInfo { timestamp };
     data_callback(&data, &info);
+}
+
+/// Cast a byte slice into a shared slice of the desired type.
+///
+/// Safety: it's up to the caller to ensure the input slice has valid bit representations.
+#[inline]
+unsafe fn cast_slice<T>(v: &[u8]) -> &[T] {
+    debug_assert!(v.len() % std::mem::size_of::<T>() == 0);
+    std::slice::from_raw_parts(v.as_ptr() as *const T, v.len() / std::mem::size_of::<T>())
+}
+
+/// Copy one ASIO input buffer into the interleaved CPAL byte buffer for a "plain" (fixed-width,
+/// endian-swappable) sample type. Does not invoke any user callback.
+#[inline]
+unsafe fn read_plain<A, F>(
+    asio_stream: &sys::AsioStream,
+    buffer_index: usize,
+    interleaved: &mut [u8],
+    from_endianness: F,
+) where
+    A: Copy,
+    F: Fn(A) -> A,
+{
+    let interleaved: &mut [A] = cast_slice_mut(interleaved);
+    let n_frames = asio_stream.buffer_size as usize;
+    let n_channels = interleaved.len() / n_frames;
+    for ch_ix in 0..n_channels {
+        let asio_channel = asio_channel_slice::<A>(asio_stream, buffer_index, ch_ix, None);
+        for (frame, s_asio) in interleaved.chunks_mut(n_channels).zip(asio_channel) {
+            frame[ch_ix] = from_endianness(*s_asio);
+        }
+    }
+}
+
+/// Write the interleaved CPAL byte buffer into one ASIO output buffer for a "plain" sample type,
+/// mixing into existing samples unless `silence_asio_buffer` requests an overwrite.
+#[inline]
+unsafe fn write_plain<A, F>(
+    asio_stream: &mut sys::AsioStream,
+    buffer_index: usize,
+    interleaved: &[u8],
+    silence_asio_buffer: bool,
+    mix_samples: F,
+) where
+    A: Copy,
+    F: Fn(A, A) -> A,
+{
+    let interleaved: &[A] = cast_slice(interleaved);
+    let n_channels = interleaved.len() / asio_stream.buffer_size as usize;
+    for ch_ix in 0..n_channels {
+        let asio_channel = asio_channel_slice_mut::<A>(asio_stream, buffer_index, ch_ix, None);
+        if silence_asio_buffer {
+            asio_channel.align_to_mut::<u8>().1.fill(0);
+        }
+        for (frame, s_asio) in interleaved.chunks(n_channels).zip(asio_channel) {
+            *s_asio = mix_samples(*s_asio, frame[ch_ix]);
+        }
+    }
+}
+
+/// Copy one ASIO 24-bit input buffer into the interleaved CPAL byte buffer (as `I24`).
+#[inline]
+unsafe fn read_i24(
+    asio_stream: &sys::AsioStream,
+    buffer_index: usize,
+    interleaved: &mut [u8],
+    little_endian: bool,
+) {
+    let interleaved: &mut [I24] = cast_slice_mut(interleaved);
+    let n_frames = asio_stream.buffer_size as usize;
+    let n_channels = interleaved.len() / n_frames;
+    let asio_sample_size_bytes = 3;
+    for ch_ix in 0..n_channels {
+        let asio_channel = asio_channel_slice::<u8>(
+            asio_stream,
+            buffer_index,
+            ch_ix,
+            Some(n_frames * asio_sample_size_bytes),
+        );
+        for (channel_sample, sample_in_buffer) in asio_channel
+            .chunks(asio_sample_size_bytes)
+            .zip(interleaved.iter_mut().skip(ch_ix).step_by(n_channels))
+        {
+            let sample = i24_bytes_to_i32(
+                &[channel_sample[0], channel_sample[1], channel_sample[2]],
+                little_endian,
+            );
+            *sample_in_buffer = I24::new(sample).unwrap();
+        }
+    }
+}
+
+/// Write the interleaved CPAL byte buffer (as `I24`) into one ASIO 24-bit output buffer.
+#[inline]
+unsafe fn write_i24(
+    asio_stream: &mut sys::AsioStream,
+    buffer_index: usize,
+    interleaved: &[u8],
+    silence_asio_buffer: bool,
+    little_endian: bool,
+) {
+    let interleaved: &[I24] = cast_slice(interleaved);
+    let asio_sample_size_bytes = 3;
+    let n_channels = interleaved.len() / asio_stream.buffer_size as usize;
+    for ch_ix in 0..n_channels {
+        let asio_channel = asio_channel_slice_mut::<u8>(
+            asio_stream,
+            buffer_index,
+            ch_ix,
+            Some(asio_stream.buffer_size as usize * asio_sample_size_bytes),
+        );
+        if silence_asio_buffer {
+            asio_channel.align_to_mut::<u8>().1.fill(0);
+        }
+        for (channel_sample, sample_in_buffer) in asio_channel
+            .chunks_mut(asio_sample_size_bytes)
+            .zip(interleaved.iter().skip(ch_ix).step_by(n_channels))
+        {
+            let result = if silence_asio_buffer {
+                sample_in_buffer.inner()
+            } else {
+                let sample = i24_bytes_to_i32(
+                    &[channel_sample[0], channel_sample[1], channel_sample[2]],
+                    little_endian,
+                );
+                (sample_in_buffer.inner() + sample).clamp(-8388608, 8388607)
+            };
+            let bytes = result.to_le_bytes();
+            if little_endian {
+                channel_sample[0] = bytes[0];
+                channel_sample[1] = bytes[1];
+                channel_sample[2] = bytes[2];
+            } else {
+                channel_sample[2] = bytes[0];
+                channel_sample[1] = bytes[1];
+                channel_sample[0] = bytes[2];
+            }
+        }
+    }
+}
+
+/// Dispatch the per-format conversion that copies the current ASIO input buffer into the
+/// interleaved CPAL input buffer for the duplex callback.
+#[inline]
+unsafe fn read_input_to_interleaved(
+    stream_type: &sys::AsioSampleType,
+    sample_format: SampleFormat,
+    asio_stream: &sys::AsioStream,
+    buffer_index: usize,
+    interleaved: &mut [u8],
+) {
+    use sys::AsioSampleType::*;
+    match (stream_type, sample_format) {
+        (&ASIOSTInt16LSB, SampleFormat::I16) => {
+            read_plain::<i16, _>(asio_stream, buffer_index, interleaved, from_le)
+        }
+        (&ASIOSTInt16MSB, SampleFormat::I16) => {
+            read_plain::<i16, _>(asio_stream, buffer_index, interleaved, from_be)
+        }
+        (&ASIOSTInt32LSB, SampleFormat::I32) => {
+            read_plain::<i32, _>(asio_stream, buffer_index, interleaved, from_le)
+        }
+        (&ASIOSTInt32MSB, SampleFormat::I32) => {
+            read_plain::<i32, _>(asio_stream, buffer_index, interleaved, from_be)
+        }
+        (&ASIOSTFloat32LSB, SampleFormat::F32) => {
+            read_plain::<u32, _>(asio_stream, buffer_index, interleaved, from_le)
+        }
+        (&ASIOSTFloat32MSB, SampleFormat::F32) => {
+            read_plain::<u32, _>(asio_stream, buffer_index, interleaved, from_be)
+        }
+        (&ASIOSTFloat64LSB, SampleFormat::F64) => {
+            read_plain::<u64, _>(asio_stream, buffer_index, interleaved, from_le)
+        }
+        (&ASIOSTFloat64MSB, SampleFormat::F64) => {
+            read_plain::<u64, _>(asio_stream, buffer_index, interleaved, from_be)
+        }
+        (&ASIOSTInt24LSB, SampleFormat::I24) => {
+            read_i24(asio_stream, buffer_index, interleaved, true)
+        }
+        (&ASIOSTInt24MSB, SampleFormat::I24) => {
+            read_i24(asio_stream, buffer_index, interleaved, false)
+        }
+        unsupported => unreachable!(
+            "`build_duplex_stream_raw` validated the input format but saw {unsupported:?}"
+        ),
+    }
+}
+
+/// Dispatch the per-format conversion that writes the interleaved CPAL output buffer into the
+/// current ASIO output buffer for the duplex callback.
+#[inline]
+unsafe fn write_output_from_interleaved(
+    stream_type: &sys::AsioSampleType,
+    sample_format: SampleFormat,
+    asio_stream: &mut sys::AsioStream,
+    buffer_index: usize,
+    interleaved: &[u8],
+    silence: bool,
+) {
+    use sys::AsioSampleType::*;
+    match (sample_format, stream_type) {
+        (SampleFormat::I16, &ASIOSTInt16LSB) => write_plain::<i16, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| from_le(old).saturating_add(new).to_le(),
+        ),
+        (SampleFormat::I16, &ASIOSTInt16MSB) => write_plain::<i16, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| from_be(old).saturating_add(new).to_be(),
+        ),
+        (SampleFormat::I32, &ASIOSTInt32LSB) => write_plain::<i32, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| from_le(old).saturating_add(new).to_le(),
+        ),
+        (SampleFormat::I32, &ASIOSTInt32MSB) => write_plain::<i32, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| from_be(old).saturating_add(new).to_be(),
+        ),
+        (SampleFormat::F32, &ASIOSTFloat32LSB) => write_plain::<u32, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| {
+                (f32::from_bits(from_le(old)) + f32::from_bits(new))
+                    .to_bits()
+                    .to_le()
+            },
+        ),
+        (SampleFormat::F32, &ASIOSTFloat32MSB) => write_plain::<u32, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| {
+                (f32::from_bits(from_be(old)) + f32::from_bits(new))
+                    .to_bits()
+                    .to_be()
+            },
+        ),
+        (SampleFormat::F64, &ASIOSTFloat64LSB) => write_plain::<u64, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| {
+                (f64::from_bits(from_le(old)) + f64::from_bits(new))
+                    .to_bits()
+                    .to_le()
+            },
+        ),
+        (SampleFormat::F64, &ASIOSTFloat64MSB) => write_plain::<u64, _>(
+            asio_stream,
+            buffer_index,
+            interleaved,
+            silence,
+            |old, new| {
+                (f64::from_bits(from_be(old)) + f64::from_bits(new))
+                    .to_bits()
+                    .to_be()
+            },
+        ),
+        (SampleFormat::I24, &ASIOSTInt24LSB) => {
+            write_i24(asio_stream, buffer_index, interleaved, silence, true)
+        }
+        (SampleFormat::I24, &ASIOSTInt24MSB) => {
+            write_i24(asio_stream, buffer_index, interleaved, silence, false)
+        }
+        unsupported => unreachable!(
+            "`build_duplex_stream_raw` validated the output format but saw {unsupported:?}"
+        ),
+    }
 }

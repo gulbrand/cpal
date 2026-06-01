@@ -827,6 +827,29 @@ impl Driver {
         self.create_streams(input_buffer_infos, output_buffer_infos, buffer_size)
     }
 
+    /// Prepare a full-duplex stream with both input and output buffers.
+    ///
+    /// Both directions are allocated in a single `ASIOCreateBuffers` call so that the driver
+    /// drives them from one `bufferSwitch` callback on a shared clock. Because only the latest
+    /// call to `ASIOCreateBuffers` is relevant, this destroys any previously active buffers and
+    /// recreates them.
+    ///
+    /// `num_input_channels` / `num_output_channels` are the desired channel counts for each
+    /// direction.
+    ///
+    /// `buffer_size` sets the desired buffer size. If `None` is passed in, the default buffer
+    /// size for the device is used.
+    pub fn prepare_duplex_stream(
+        &self,
+        num_input_channels: usize,
+        num_output_channels: usize,
+        buffer_size: Option<i32>,
+    ) -> Result<AsioStreams, AsioError> {
+        let input_buffer_infos = prepare_buffer_infos(true, num_input_channels);
+        let output_buffer_infos = prepare_buffer_infos(false, num_output_channels);
+        self.create_streams(input_buffer_infos, output_buffer_infos, buffer_size)
+    }
+
     /// Releases buffers allocations.
     ///
     /// This will `stop` the stream if the driver is `Running`.
