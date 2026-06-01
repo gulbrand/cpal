@@ -422,7 +422,7 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(Error) + Send + 'static;
 
-    /// Create a synchronized duplex stream whose input and output share the same hardware clock
+    /// Create a synchronized duplex stream whose input and output share the same clock
     /// or OS provided bidirectional aggregate device (MacOS). MacOS Aggregate device drift
     /// compensation is not required.
     ///
