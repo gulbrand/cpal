@@ -114,10 +114,12 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
     type SupportedInputConfigs: Iterator<Item = SupportedStreamConfigRange>;
     /// The iterator type yielding supported output stream formats.
     type SupportedOutputConfigs: Iterator<Item = SupportedStreamConfigRange>;
-    /// The stream type created by [`build_input_stream_raw`] and [`build_output_stream_raw`].
+    /// The stream type created by [`build_input_stream_raw`] and [`build_output_stream_raw`],
+    /// and [`build_duplex_stream_raw`].
     ///
     /// [`build_input_stream_raw`]: Self::build_input_stream_raw
     /// [`build_output_stream_raw`]: Self::build_output_stream_raw
+    /// [`build_duplex_stream_raw`]: Self::build_duplex_stream_raw
     type Stream: StreamTrait;
 
     /// Structured description of the device with metadata.
@@ -164,9 +166,7 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
     /// rendered output share a single hardware clock.
     ///
     /// Returning `true` is a contract that input and output sides will run from one device-level
-    /// callback — not merely that the device exposes both directions. For example, a USB headset
-    /// whose microphone and headphones enumerate as independent USB audio class devices supports
-    /// both directions but cannot guarantee a shared clock, and should return `false`.
+    /// callback, or an OS driver aggregate (such as an Aggregate Device on MacOS).
     ///
     /// The default implementation returns `false`; hosts that can guarantee a shared clock should
     /// override.
@@ -422,12 +422,9 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
         D: FnMut(&mut Data, &OutputCallbackInfo) + Send + 'static,
         E: FnMut(Error) + Send + 'static;
 
-    /// Create a synchronized duplex stream whose input and output share the same hardware clock.
-    ///
-    /// Unlike running an independent input stream and output stream and synchronizing them
-    /// manually, a duplex stream guarantees that captured and rendered audio align on a single
-    /// device callback. This is the appropriate primitive for low-latency processing pipelines
-    /// (e.g. live effects) that must read and write a frame on the same tick.
+    /// Create a synchronized duplex stream whose input and output share the same hardware clock
+    /// or OS provided bidirectional aggregate device (MacOS). MacOS Aggregate device drift
+    /// compensation is not required.
     ///
     /// # Parameters
     ///
@@ -439,13 +436,30 @@ pub trait DeviceTrait: PartialEq + Eq + Hash + Debug + Display {
     ///
     /// # Errors
     ///
-    /// - [`ErrorKind::UnsupportedOperation`] if the host does not support duplex streams.
-    /// - [`ErrorKind::UnsupportedConfig`] if the configuration is not supported by the device.
+    /// - [`ErrorKind::UnsupportedOperation`] if the host or device does not support duplex
+    ///   streams.
+    /// - [`ErrorKind::UnsupportedConfig`] if the sample rate, channel counts, buffer size, or
+    ///   sample format is not supported by the device.
     /// - [`ErrorKind::DeviceNotAvailable`] if the device has been disconnected.
+    /// - [`ErrorKind::DeviceBusy`] if the device is temporarily in use by another application.
+    /// - [`ErrorKind::PermissionDenied`] if the process lacks permission to access the device
+    ///   (e.g. microphone access on macOS).
+    /// - [`ErrorKind::InvalidInput`] if the configuration parameters are invalid.
+    /// - [`ErrorKind::StreamInvalidated`] if the device's sample rate or buffer size changed
+    ///   during stream creation, or an internal lock was poisoned.
+    /// - [`ErrorKind::ResourceExhausted`] if the host fails to spawn an internal monitoring
+    ///   thread.
+    /// - [`ErrorKind::BackendError`] for unclassified backend failures.
     ///
     /// [`ErrorKind::UnsupportedOperation`]: crate::ErrorKind::UnsupportedOperation
     /// [`ErrorKind::UnsupportedConfig`]: crate::ErrorKind::UnsupportedConfig
     /// [`ErrorKind::DeviceNotAvailable`]: crate::ErrorKind::DeviceNotAvailable
+    /// [`ErrorKind::DeviceBusy`]: crate::ErrorKind::DeviceBusy
+    /// [`ErrorKind::PermissionDenied`]: crate::ErrorKind::PermissionDenied
+    /// [`ErrorKind::InvalidInput`]: crate::ErrorKind::InvalidInput
+    /// [`ErrorKind::StreamInvalidated`]: crate::ErrorKind::StreamInvalidated
+    /// [`ErrorKind::ResourceExhausted`]: crate::ErrorKind::ResourceExhausted
+    /// [`ErrorKind::BackendError`]: crate::ErrorKind::BackendError
     fn build_duplex_stream<T, D, E>(
         &self,
         config: DuplexStreamConfig,
