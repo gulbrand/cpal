@@ -125,6 +125,10 @@ pub unsafe extern "C" fn ASIOExit() -> ASIOError {
     0
 }
 #[no_mangle]
+pub unsafe extern "C" fn ASIOControlPanel() -> ASIOError {
+    0
+}
+#[no_mangle]
 pub unsafe extern "C" fn ASIOStart() -> ASIOError {
     0
 }

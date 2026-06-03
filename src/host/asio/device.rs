@@ -18,8 +18,8 @@ pub struct Device {
     name: String,
 
     // Metadata cached during enumeration
-    channels_in: ChannelCount,
-    channels_out: ChannelCount,
+    pub(super) channels_in: ChannelCount,
+    pub(super) channels_out: ChannelCount,
     sample_rate: SampleRate,
     buffer_size_min: FrameCount,
     buffer_size_max: FrameCount,
