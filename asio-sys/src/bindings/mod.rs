@@ -487,6 +487,21 @@ impl Asio {
     }
 }
 
+/// Open the currently-loaded ASIO driver's control panel.
+///
+/// ASIO exposes a single global `ASIOControlPanel()` entry point that acts on
+/// whatever driver is currently loaded (via `ASIOInit`, i.e. the driver behind
+/// an active [`Driver`]). It must therefore be called from the same process —
+/// and, per the ASIO spec, ideally the same thread — that loaded the driver.
+/// The call is typically modal: it blocks until the user closes the dialog,
+/// and changes the user makes may trigger a driver reset (surfaced to the host
+/// as a stream reset request).
+///
+/// Returns an error if no driver is currently loaded.
+pub fn control_panel() -> Result<(), AsioError> {
+    unsafe { asio_result!(ai::ASIOControlPanel()) }
+}
+
 impl BufferCallback {
     /// Calls the inner callback.
     fn run(&mut self, callback_info: &CallbackInfo) {
